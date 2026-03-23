@@ -1,0 +1,11 @@
+﻿# Recommended Python 3.9 environment for the current training code.
+# Install torch/torchvision separately to match your CUDA runtime.
+
+numpy>=1.23,<2.0
+pillow>=9.0
+six>=1.16
+scipy>=1.10,<2.0
+matplotlib>=3.6
+tqdm>=4.64
+pandas>=1.5
+seaborn>=0.12

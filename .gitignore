@@ -1,0 +1,25 @@
+tools/remote-workflow/config.psd1
+
+# Local outputs
+remote_results/
+logs/
+results/
+
+# Python caches
+__pycache__/
+*.pyc
+data/__pycache__/
+
+# Local datasets and archives
+data/*.tar.gz
+data/cifar-10-batches-py/
+data/cifar-100-python/
+data/raw/
+data/processed/
+
+# Local reading materials / notes not needed for training sync
+documents/
+yuanxing_icml2026_latex-main/
+
+# Large local auxiliary artifacts
+*.bak-*

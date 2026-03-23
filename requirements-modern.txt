@@ -1,0 +1,8 @@
+﻿# For the current top-level main.py (Python 3)
+# NOTE: torch/torchvision wheels depend on CPU vs CUDA.
+# Install torch/torchvision separately (see instructions in README or my notes).
+
+numpy>=1.23,<2.0
+pillow>=9.0
+six>=1.16
+scipy>=1.10,<2.0

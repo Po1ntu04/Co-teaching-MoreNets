@@ -1,0 +1,10 @@
+# Target environment requested by user (Python 3.7 + PyTorch 1.6.x)
+# PyTorch/torchvision/cudatoolkit are best installed via conda to match CUDA runtime.
+# This file contains the pure-Python deps this repo needs.
+
+numpy==1.21.2
+pillow>=7.0
+six>=1.15
+
+# NOTE: torch-geometric/torch-scatter/torch-sparse are NOT required by this repo.
+# If your wider project needs them, install matching wheels separately.
