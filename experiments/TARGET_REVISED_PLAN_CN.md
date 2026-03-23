@@ -2,6 +2,10 @@
 
 ## 1. 使用约定
 
+- 推荐分两种同步模式：
+
+### 模式 A：本地一键 push + 远端自动 pull
+
 - 本地修改代码后，同步到远端：
   ```powershell
   powershell -ExecutionPolicy Bypass -File tools/remote-workflow/sync_and_update_remote.ps1
@@ -10,6 +14,27 @@
   ```powershell
   powershell -ExecutionPolicy Bypass -File tools/remote-workflow/sync_and_update_remote.ps1 -AutoCommit -Message "exp: <简短说明>"
   ```
+- 说明：
+  - 这个模式会从本地再发起一次新的 `ssh` 连接去远端更新仓库。
+  - 适合你不想切到远端窗口手动执行命令时使用。
+
+### 模式 B：你已经开着远端 SSH 窗口，推荐用这个
+
+- 本地只负责提交和 push：
+  ```powershell
+  powershell -ExecutionPolicy Bypass -File tools/remote-workflow/sync_branch.ps1 -AutoCommit -Message "exp: <简短说明>"
+  ```
+- 然后在你已经打开的远端终端里执行：
+  ```bash
+  cd /data1/yuzhixiang/work/Co-teaching-MoreNets
+  git fetch origin
+  git checkout <分支名>
+  git pull --ff-only origin <分支名>
+  ```
+- 说明：
+  - 这是当前更推荐的模式。
+  - 它不会再新开一条额外的远端命令链，和你现有的 VS Code Remote SSH 使用习惯更一致。
+
 - 远端指定设备运行时，用：
   ```bash
   CUDA_VISIBLE_DEVICES=<设备号> python -u main.py ...

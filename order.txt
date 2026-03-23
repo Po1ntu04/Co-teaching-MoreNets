@@ -65,8 +65,10 @@ powershell -ExecutionPolicy Bypass -File tools/remote-workflow/check_remote.ps1
 
 
 ==================================================
-4. Daily use: one-click sync local branch and remote checkout
+4. Daily use: sync code to remote
 ==================================================
+
+Mode A: local one-click sync
 
 If changes are already committed, run locally:
 
@@ -78,6 +80,23 @@ If changes are not yet committed, run locally:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools/remote-workflow/sync_and_update_remote.ps1 -AutoCommit -Message "wip: sync before remote update"
+```
+
+Mode B: recommended if you already have a server SSH window open
+
+Run locally:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/remote-workflow/sync_branch.ps1 -AutoCommit -Message "wip: sync before remote update"
+```
+
+Then run in the server SSH window:
+
+```bash
+cd /data1/yuzhixiang/work/Co-teaching-MoreNets
+git fetch origin
+git checkout <branch-name>
+git pull --ff-only origin <branch-name>
 ```
 
 
