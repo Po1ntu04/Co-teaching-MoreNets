@@ -1,0 +1,187 @@
+﻿Co-Teaching-MoreNets workflow order
+
+All commands below are grouped by where they should run.
+
+==================================================
+1. Local only: rebuild a clean git history
+==================================================
+
+Run in:
+`D:\study_file\Co-teaching`
+
+PowerShell:
+
+```powershell
+Remove-Item -Recurse -Force .git
+git init
+git branch -M main
+git add .
+git status
+```
+
+Check `git status` carefully.
+These paths should NOT appear in the staged file list:
+- `data/cifar-10-python.tar.gz`
+- `data/cifar-10-batches-py/`
+- `documents/`
+- `results/`
+- `yuanxing_icml2026_latex-main/`
+
+If the staged files look correct, continue:
+
+```powershell
+git commit -m "Initial clean commit"
+git remote add origin git@github.com:Po1ntu04/Co-teaching-MoreNets.git
+git push -u origin main
+```
+
+
+==================================================
+2. Remote only: create isolated project repo
+==================================================
+
+Run in the server SSH window:
+
+```bash
+mkdir -p /data1/yuzhixiang/work
+cd /data1/yuzhixiang/work
+git clone https://github.com/Po1ntu04/Co-teaching-MoreNets.git Co-teaching-MoreNets
+cd /data1/yuzhixiang/work/Co-teaching-MoreNets
+git remote -v
+```
+
+
+==================================================
+3. Local only: align local workflow config
+==================================================
+
+Run in:
+`D:\study_file\Co-teaching`
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/remote-workflow/set_local_git_remote.ps1
+powershell -ExecutionPolicy Bypass -File tools/remote-workflow/check_remote.ps1
+```
+
+
+==================================================
+4. Daily use: one-click sync local branch and remote checkout
+==================================================
+
+If changes are already committed, run locally:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/remote-workflow/sync_and_update_remote.ps1
+```
+
+If changes are not yet committed, run locally:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/remote-workflow/sync_and_update_remote.ps1 -AutoCommit -Message "wip: sync before remote update"
+```
+
+
+==================================================
+5. Remote only: manual update if needed
+==================================================
+
+Run in the server SSH window:
+
+```bash
+cd /data1/yuzhixiang/work/Co-teaching-MoreNets
+git fetch origin
+git checkout main
+git pull --ff-only origin main
+```
+
+If you use another branch, replace `main` with that branch name.
+
+
+==================================================
+6. Remote environment: Python 3.9 conda env
+==================================================
+
+Confirmed conda base:
+`/data1/yuzhixiang/opt/miniconda3`
+
+Confirmed source command:
+
+```bash
+source /data1/yuzhixiang/opt/miniconda3/etc/profile.d/conda.sh
+```
+
+Recommended environment path:
+`/data1/yuzhixiang/.conda/envs/coteaching-py39`
+
+Option A: use the local helper script
+
+Run locally:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/remote-workflow/setup_remote_env.ps1
+```
+
+Option B: create it manually in the server SSH window
+
+```bash
+source /data1/yuzhixiang/opt/miniconda3/etc/profile.d/conda.sh
+conda create -y -p /data1/yuzhixiang/.conda/envs/coteaching-py39 python=3.9
+conda activate /data1/yuzhixiang/.conda/envs/coteaching-py39
+python -m pip install --upgrade pip
+python -m pip install -r requirements-py39.txt
+```
+
+Torch and torchvision must match the server CUDA runtime.
+Install them separately after checking `nvidia-smi`.
+
+
+==================================================
+7. Remote run: tmux training
+==================================================
+
+Option A: start from local helper
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/remote-workflow/run_remote.ps1 -Command "python -u main.py --dataset cifar10 --noise_type symmetric --noise_rate 0.5"
+```
+
+Option B: start manually in the server SSH window
+
+```bash
+cd /data1/yuzhixiang/work/Co-teaching-MoreNets
+source /data1/yuzhixiang/opt/miniconda3/etc/profile.d/conda.sh
+conda activate /data1/yuzhixiang/.conda/envs/coteaching-py39
+tmux new -s coteaching-run
+python -u main.py --dataset cifar10 --noise_type symmetric --noise_rate 0.5
+```
+
+
+==================================================
+8. Logs and results
+==================================================
+
+Tail logs from local:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/remote-workflow/tail_remote.ps1
+```
+
+Fetch results back to local:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/remote-workflow/fetch_remote_results.ps1
+```
+
+Stop the tmux session from local:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/remote-workflow/stop_remote.ps1 -Mode tmux
+```
+
+
+==================================================
+9. Important rule
+==================================================
+
+Do not sync datasets, papers, local experiment outputs, or unrelated writing materials to GitHub.
+This repo should only track source code, configs, scripts, and small necessary docs.

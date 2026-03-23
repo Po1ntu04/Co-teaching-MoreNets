@@ -17,11 +17,13 @@ Git moves source code. SSH controls the remote machine. `scp` only pulls results
 - SSH alias: `b101`
 - Remote host: `b101.guhk.cc`
 - Remote user: `yuzhixiang`
-- Recommended remote repo path: `/data1/yuzhixiang/work/Co-Teaching`
+- Recommended remote repo path: `/data1/yuzhixiang/work/Co-teaching-MoreNets`
 - Local Git URL: `git@github.com:Po1ntu04/Co-teaching-MoreNets.git`
 - Remote Git URL: `https://github.com/Po1ntu04/Co-teaching-MoreNets.git`
 - Main remote execution mode: `tmux`
 - Default conda env path: `/data1/yuzhixiang/.conda/envs/coteaching-py39`
+- Confirmed conda base: `/data1/yuzhixiang/opt/miniconda3`
+- Confirmed `CondaInit`: `source /data1/yuzhixiang/opt/miniconda3/etc/profile.d/conda.sh`
 
 ## Files
 
