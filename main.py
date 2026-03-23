@@ -35,8 +35,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--print_freq", type=int, default=50)
     parser.add_argument("--num_workers", type=int, default=4, help="how many subprocesses to use for data loading")
+    parser.add_argument("--prefetch_factor", type=int, default=4, help="prefetch batches per worker when num_workers > 0")
+    parser.add_argument("--pin_memory", dest="pin_memory", action="store_true", help="pin host memory for faster H2D copies")
+    parser.add_argument("--no_pin_memory", dest="pin_memory", action="store_false", help="disable DataLoader pin_memory")
+    parser.add_argument(
+        "--persistent_workers",
+        dest="persistent_workers",
+        action="store_true",
+        help="keep DataLoader workers alive across epochs",
+    )
+    parser.add_argument(
+        "--no_persistent_workers",
+        dest="persistent_workers",
+        action="store_false",
+        help="disable DataLoader persistent_workers",
+    )
+    parser.add_argument("--cudnn_benchmark", dest="cudnn_benchmark", action="store_true", help="enable cudnn benchmark")
+    parser.add_argument("--no_cudnn_benchmark", dest="cudnn_benchmark", action="store_false", help="disable cudnn benchmark")
+    parser.add_argument("--tf32", dest="tf32", action="store_true", help="allow TF32 matmul/cudnn on Ampere+ GPUs")
+    parser.add_argument("--no_tf32", dest="tf32", action="store_false", help="disable TF32 matmul/cudnn")
     parser.add_argument("--num_iter_per_epoch", type=int, default=400)
     parser.add_argument("--epoch_decay_start", type=int, default=80)
+    parser.set_defaults(pin_memory=True, persistent_workers=True, cudnn_benchmark=True, tf32=True)
     #------------------------------------------------------------------------#
     parser.add_argument("--num_models", type=int, default=3, help="M: number of peer models (>=2)")
     parser.add_argument("--sam_rho", type=float, default=0.05, help="SAM perturbation coefficient (rho)")
@@ -841,6 +861,12 @@ def main():
         raise ValueError("num_models must be at least 2 for interactive co-teaching.")
 
     set_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = bool(args.cudnn_benchmark)
+        if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
+            torch.backends.cuda.matmul.allow_tf32 = bool(args.tf32)
+        if hasattr(torch.backends.cudnn, "allow_tf32"):
+            torch.backends.cudnn.allow_tf32 = bool(args.tf32)
 
     # Hyper parameters
     batch_size = args.batch_size
@@ -864,29 +890,35 @@ def main():
         alpha_plan[i] = float(args.n_epoch - i) / (args.n_epoch - args.epoch_decay_start) * learning_rate
         beta1_plan[i] = mom2
 
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "num_workers": args.num_workers,
+        "pin_memory": bool(args.pin_memory and torch.cuda.is_available()),
+    }
+    if args.num_workers > 0:
+        loader_kwargs["persistent_workers"] = bool(args.persistent_workers)
+        loader_kwargs["prefetch_factor"] = max(2, int(args.prefetch_factor))
+
     # Data loaders
     train_loader = torch.utils.data.DataLoader(
         dataset=train_dataset,
-        batch_size=batch_size,
-        num_workers=args.num_workers,
         drop_last=args.drop_last,
         shuffle=True,
+        **loader_kwargs,
     )
     val_loader = None
     if val_dataset is not None:
         val_loader = torch.utils.data.DataLoader(
             dataset=val_dataset,
-            batch_size=batch_size,
-            num_workers=args.num_workers,
             drop_last=False,
             shuffle=False,
+            **loader_kwargs,
         )
     test_loader = torch.utils.data.DataLoader(
         dataset=test_dataset,
-        batch_size=batch_size,
-        num_workers=args.num_workers,
         drop_last=False,
         shuffle=False,
+        **loader_kwargs,
     )
 
     # Define models and optimizers

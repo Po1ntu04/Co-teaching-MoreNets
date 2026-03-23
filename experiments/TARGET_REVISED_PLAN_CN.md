@@ -85,6 +85,10 @@
   ```bash
   CUDA_VISIBLE_DEVICES=<设备号> python -u main.py --dataset cifar10 --noise_type symmetric --noise_rate 0.4 --num_models 3 --q_mode loss --mstep_mode hard --sam_rho 0 --replay_size 0 --replay_ratio 0 --lambda_mode accuracy --lambda_patience 9999
   ```
+- 高显存加速版：
+  ```bash
+  CUDA_VISIBLE_DEVICES=<设备号> python -u main.py --dataset cifar10 --noise_type symmetric --noise_rate 0.4 --num_models 3 --q_mode loss --mstep_mode hard --sam_rho 0 --replay_size 0 --replay_ratio 0 --lambda_mode accuracy --lambda_patience 9999 --batch_size 512 --num_workers 8 --prefetch_factor 4 --drop_last
+  ```
 - 目的：
   - 作为 classic Co-teaching 风格近似基线。
 - 预期观察：
@@ -94,6 +98,8 @@
 - 微调建议：
   - 如果训练不稳，先减小 `lr`。
   - 如果过早塌缩，可增大 `num_gradual`。
+  - 如果显存仍明显富余，按 `512 -> 768 -> 1024` 逐步加大 `batch_size`。
+  - 如果 GPU 利用率不高而 CPU 忙，优先增大 `num_workers`。
 
 ### 实验 2：Soft Q + ERM
 
