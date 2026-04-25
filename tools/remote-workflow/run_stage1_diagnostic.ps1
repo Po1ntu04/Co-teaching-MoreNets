@@ -147,11 +147,11 @@ function Get-RemoteGpuSelection {
         [hashtable]$Config,
         [string]$Target
     )
-    $script = @'
-set -euo pipefail
-nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits
-'@
-    $output = Invoke-Stage1RemoteScript -Config $Config -Target $Target -Script $script -CaptureOutput
+    $query = "nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits"
+    $output = & ssh -o StrictHostKeyChecking=accept-new -p $Config.Port $Target $query
+    if ($LASTEXITCODE -ne 0) {
+        throw "Remote nvidia-smi query failed."
+    }
     $gpus = @()
     foreach ($line in $output) {
         $parts = ([string]$line).Split(",", 5)
