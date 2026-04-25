@@ -223,7 +223,9 @@ def compute_rate_schedule(
     forget_rate: float, num_gradual: int, exponent: float, n_epoch: int
 ) -> np.ndarray:
     schedule = np.ones(n_epoch) * forget_rate
-    schedule[:num_gradual] = np.linspace(0, forget_rate ** exponent, num_gradual)
+    gradual = min(max(int(num_gradual), 0), int(n_epoch))
+    if gradual > 0:
+        schedule[:gradual] = np.linspace(0, forget_rate ** exponent, gradual)
     return schedule
 
 
