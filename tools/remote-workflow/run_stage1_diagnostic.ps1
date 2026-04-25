@@ -347,6 +347,28 @@ function Invoke-RunAudit {
     }
 }
 
+function Test-RunAlreadyAudited {
+    param([string]$AuditPath)
+    if (-not (Test-Path $AuditPath)) {
+        return $false
+    }
+    try {
+        $report = Get-Content -Raw -Path $AuditPath | ConvertFrom-Json
+        if ($report.num_runs -lt 1) {
+            return $false
+        }
+        foreach ($property in $report.runs.PSObject.Properties) {
+            if ($property.Value.diagnostics_ok) {
+                return $true
+            }
+        }
+    }
+    catch {
+        return $false
+    }
+    return $false
+}
+
 $repoRoot = Get-RepoRoot
 Set-Location $repoRoot
 $config = Get-WorkflowConfig
@@ -419,12 +441,16 @@ if (-not $SmokeOnly) {
 
 foreach ($run in $runs) {
     Write-Host "== start $($run.Name) =="
+    $localRunRoot = Join-Path $localResultRoot $run.Name
+    $auditOut = Join-Path $localRunRoot "stage1_audit.json"
+    if (Test-RunAlreadyAudited -AuditPath $auditOut) {
+        Write-Host "Skipping already audited run: $($run.Name)"
+        continue
+    }
     Start-RemoteRun -Config $config -Target $target -Session $run.Session -LogFile $run.Log -RunCommand $run.Command
     if (-not $NoWait) {
         Wait-RemoteRun -Config $config -Target $target -Session $run.Session -LogFile $run.Log -PollSeconds $PollSeconds
-        $localRunRoot = Join-Path $localResultRoot $run.Name
         Copy-RemoteResults -Config $config -Target $target -RemotePath "$($config.RepoDir)/$($run.Result)" -LocalPath $localRunRoot
-        $auditOut = Join-Path $localRunRoot "stage1_audit.json"
         Invoke-RunAudit -Python $python -Root $localRunRoot -Output $auditOut
     }
 }
