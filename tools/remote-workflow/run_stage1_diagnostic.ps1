@@ -51,13 +51,19 @@ function Resolve-Stage1SshTarget {
         "-p", [string]$Config.Port
     )
     if ($Config.ContainsKey("SshHostAlias") -and -not [string]::IsNullOrWhiteSpace([string]$Config.SshHostAlias)) {
-        & ssh @options ([string]$Config.SshHostAlias) "true" 2>$null
+        $oldErrorActionPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        & ssh @options ([string]$Config.SshHostAlias) "true" *> $null
+        $ErrorActionPreference = $oldErrorActionPreference
         if ($LASTEXITCODE -eq 0) {
             return [string]$Config.SshHostAlias
         }
     }
     $directTarget = "$($Config.User)@$($Config.Host)"
-    & ssh @options $directTarget "true" 2>$null
+    $oldErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & ssh @options $directTarget "true" *> $null
+    $ErrorActionPreference = $oldErrorActionPreference
     if ($LASTEXITCODE -ne 0) {
         throw "SSH precheck failed for alias and direct target."
     }
