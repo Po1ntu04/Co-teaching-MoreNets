@@ -308,25 +308,11 @@ function Wait-RemoteRun {
         [int]$PollSeconds
     )
     while ($true) {
-        $script = @'
-set -euo pipefail
-REPO_DIR="$(decode_arg "$1")"
-SESSION="$(decode_arg "$2")"
-LOG_FILE="$(decode_arg "$3")"
-cd "$REPO_DIR"
-if tmux has-session -t "$SESSION" 2>/dev/null; then
-    echo "RUNNING"
-    tail -n 20 "$LOG_FILE" 2>/dev/null || true
-else
-    echo "DONE"
-    tail -n 80 "$LOG_FILE" 2>/dev/null || true
-fi
-'@
-        $output = Invoke-Stage1RemoteScript -Config $Config -Target $Target -Script $script -Arguments @(
-            $Config.RepoDir,
-            $Session,
-            $LogFile
-        ) -CaptureOutput
+        $remote = "cd '$($Config.RepoDir)' && if tmux has-session -t '$Session' 2>/dev/null; then echo RUNNING; tail -n 20 '$LogFile' 2>/dev/null || true; else echo DONE; tail -n 80 '$LogFile' 2>/dev/null || true; fi"
+        $output = & ssh -o StrictHostKeyChecking=accept-new -p $Config.Port $Target $remote
+        if ($LASTEXITCODE -ne 0) {
+            throw "Remote wait command failed."
+        }
         $output | ForEach-Object { Write-Host $_ }
         if (($output | Select-Object -First 1) -eq "DONE") {
             break
