@@ -49,6 +49,7 @@ function Resolve-Stage1SshTarget {
         "-o", "BatchMode=yes",
         "-o", "ConnectTimeout=10",
         "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ExitOnForwardFailure=no",
         "-p", [string]$Config.Port
     )
     if ($Config.ContainsKey("SshHostAlias") -and -not [string]::IsNullOrWhiteSpace([string]$Config.SshHostAlias)) {
@@ -92,6 +93,7 @@ decode_arg() {
     $wrapper = $wrapper -replace "`r", ""
     $sshArgs = @(
         "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ExitOnForwardFailure=no",
         "-p", [string]$Config.Port,
         $Target,
         "bash", "-s", "--"
@@ -149,7 +151,7 @@ function Get-RemoteGpuSelection {
         [string]$Target
     )
     $query = "nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits"
-    $output = & ssh -o StrictHostKeyChecking=accept-new -p $Config.Port $Target $query
+    $output = & ssh -o StrictHostKeyChecking=accept-new -o ExitOnForwardFailure=no -p $Config.Port $Target $query
     if ($LASTEXITCODE -ne 0) {
         throw "Remote nvidia-smi query failed."
     }
@@ -310,7 +312,7 @@ function Wait-RemoteRun {
     )
     while ($true) {
         $remote = "cd '$($Config.RepoDir)' && if tmux has-session -t '$Session' 2>/dev/null; then echo RUNNING; tail -n 20 '$LogFile' 2>/dev/null || true; else echo DONE; tail -n 80 '$LogFile' 2>/dev/null || true; fi"
-        $output = & ssh -o StrictHostKeyChecking=accept-new -p $Config.Port $Target $remote
+        $output = & ssh -o StrictHostKeyChecking=accept-new -o ExitOnForwardFailure=no -p $Config.Port $Target $remote
         if ($LASTEXITCODE -ne 0) {
             throw "Remote wait command failed."
         }
@@ -330,7 +332,7 @@ function Copy-RemoteResults {
         [string]$LocalPath
     )
     New-Item -ItemType Directory -Force -Path $LocalPath | Out-Null
-    & scp -o StrictHostKeyChecking=accept-new -P $Config.Port -r "${Target}:$RemotePath" $LocalPath
+    & scp -o StrictHostKeyChecking=accept-new -o ExitOnForwardFailure=no -P $Config.Port -r "${Target}:$RemotePath" $LocalPath
     if ($LASTEXITCODE -ne 0) {
         throw "scp failed: $RemotePath"
     }
