@@ -241,8 +241,8 @@ cd "$REPO_DIR"
 git fetch "$GIT_REMOTE"
 git checkout "$BRANCH"
 git pull --ff-only "$GIT_REMOTE" "$BRANCH"
-git rev-parse --abbrev-ref HEAD
-git rev-parse HEAD
+git status --short --branch
+git log -1 --format=%H
 '@
     Invoke-Stage1RemoteScript -Config $Config -Target $Target -Script $script -Arguments @(
         $Branch,
