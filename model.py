@@ -33,7 +33,7 @@ class CNN(nn.Module):
         self.bn8=nn.BatchNorm2d(256)
         self.bn9=nn.BatchNorm2d(128)
 
-    def forward(self, x,):
+    def extract_features(self, x):
         h=x
         h=self.c1(h)
         h=F.leaky_relu(call_bn(self.bn1, h), negative_slope=0.01)
@@ -62,9 +62,12 @@ class CNN(nn.Module):
         h=F.avg_pool2d(h, kernel_size=h.data.shape[2])
 
         h = h.view(h.size(0), h.size(1))
+        return h
+
+    def forward(self, x,):
+        h = self.extract_features(x)
         logit=self.l_c1(h)
         if self.top_bn:
             logit=call_bn(self.bn_c1, logit)
         return logit
-
 

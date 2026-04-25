@@ -191,6 +191,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # Explore sampling (diversity preservation when overlap is high)
     parser.add_argument("--explore_delta", type=float, default=0.0, help="fraction of batch for explore sampling (0=disabled)")
     parser.add_argument("--explore_trigger", type=float, default=0.85, help="overlap threshold to trigger explore sampling")
+    # ------------------------------------------------------------------------
+    # Stage-1 target-utility diagnostics. These options only add logging and do
+    # not change the training update path.
+    parser.add_argument("--diag_alignment", action="store_true", help="enable target-alignment diagnostics")
+    parser.add_argument("--diag_every_epoch", type=int, default=5, help="run diagnostics every N epochs")
+    parser.add_argument("--diag_batches", type=int, default=4, help="number of train batches used per diagnostic")
+    parser.add_argument("--diag_val_batches", type=int, default=2, help="number of validation batches used per diagnostic")
+    parser.add_argument(
+        "--diag_target",
+        type=str,
+        default="both",
+        choices=["clean", "noisy", "both"],
+        help="target labels for diagnostic validation gradients",
+    )
+    parser.add_argument(
+        "--diag_output_dir",
+        type=str,
+        default="results_diag/stage1_probe",
+        help="directory for diagnostic JSON/JSONL outputs",
+    )
     return parser
 
 
@@ -432,13 +452,305 @@ def ensure_dir(path: str) -> None:
         os.makedirs(path, exist_ok=True)
 
 
+def _as_label_array(values) -> np.ndarray:
+    arr = np.asarray(values)
+    if arr.ndim > 1:
+        arr = arr.reshape(arr.shape[0], -1)[:, 0]
+    return arr.astype(np.int64)
+
+
+def get_clean_labels(dataset, indices: np.ndarray) -> np.ndarray:
+    if hasattr(dataset, "train_labels"):
+        labels = _as_label_array(dataset.train_labels)
+        return labels[indices]
+    return np.zeros(len(indices), dtype=np.int64)
+
+
+def get_clean_mask(dataset, indices: np.ndarray, noisy_labels: np.ndarray) -> np.ndarray:
+    if hasattr(dataset, "noise_or_not"):
+        clean_flags = np.asarray(dataset.noise_or_not).astype(bool)
+        return clean_flags[indices]
+    return get_clean_labels(dataset, indices) == noisy_labels
+
+
+def binary_auc(scores: np.ndarray, labels: np.ndarray) -> float:
+    scores = np.asarray(scores, dtype=np.float64)
+    labels = np.asarray(labels, dtype=bool)
+    valid = np.isfinite(scores)
+    scores = scores[valid]
+    labels = labels[valid]
+    n_pos = int(labels.sum())
+    n_neg = int(labels.size - n_pos)
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+
+    order = np.argsort(scores)
+    sorted_scores = scores[order]
+    ranks = np.empty_like(sorted_scores, dtype=np.float64)
+    start = 0
+    while start < sorted_scores.size:
+        end = start + 1
+        while end < sorted_scores.size and sorted_scores[end] == sorted_scores[start]:
+            end += 1
+        ranks[start:end] = 0.5 * (start + end - 1) + 1.0
+        start = end
+
+    original_ranks = np.empty_like(ranks)
+    original_ranks[order] = ranks
+    rank_sum_pos = float(original_ranks[labels].sum())
+    return (rank_sum_pos - n_pos * (n_pos + 1) / 2.0) / float(n_pos * n_neg)
+
+
+def _safe_mean(values: np.ndarray) -> float:
+    values = np.asarray(values, dtype=np.float64)
+    if values.size == 0:
+        return float("nan")
+    return float(np.mean(values))
+
+
+def _clean_rate(mask: np.ndarray, clean_flags: np.ndarray) -> float:
+    mask = np.asarray(mask, dtype=bool)
+    if mask.sum() == 0:
+        return float("nan")
+    return float(np.asarray(clean_flags, dtype=bool)[mask].mean())
+
+
+def last_layer_error(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    probs = logits.softmax(dim=1)
+    return probs - F.one_hot(labels, num_classes=logits.size(1)).to(dtype=probs.dtype)
+
+
+def adam_last_layer_denominators(model: torch.nn.Module, optimizer: torch.optim.Optimizer) -> Tuple[torch.Tensor, torch.Tensor]:
+    weight = model.l_c1.weight
+    bias = model.l_c1.bias
+    state_w = optimizer.state.get(weight, {})
+    state_b = optimizer.state.get(bias, {}) if bias is not None else {}
+    if "exp_avg_sq" in state_w:
+        denom_w = state_w["exp_avg_sq"].detach().sqrt().clamp_min(1e-8)
+    else:
+        denom_w = torch.ones_like(weight)
+    if bias is not None and "exp_avg_sq" in state_b:
+        denom_b = state_b["exp_avg_sq"].detach().sqrt().clamp_min(1e-8)
+    elif bias is not None:
+        denom_b = torch.ones_like(bias)
+    else:
+        denom_b = torch.ones(weight.size(0), device=weight.device, dtype=weight.dtype)
+    return denom_w, denom_b
+
+
+def alignment_scores(
+    train_features: torch.Tensor,
+    train_errors: torch.Tensor,
+    val_features: torch.Tensor,
+    val_errors: torch.Tensor,
+    denom_w: torch.Tensor,
+    denom_b: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    val_grad_w = torch.einsum("vc,vd->cd", val_errors, val_features) / max(1, val_features.size(0))
+    val_grad_b = val_errors.mean(dim=0)
+    raw = torch.einsum("bc,bd,cd->b", train_errors, train_features, val_grad_w)
+    raw = raw + torch.einsum("bc,c->b", train_errors, val_grad_b)
+    adam = torch.einsum("bc,bd,cd->b", train_errors, train_features, val_grad_w / denom_w)
+    adam = adam + torch.einsum("bc,c->b", train_errors, val_grad_b / denom_b)
+    return raw, adam
+
+
+def _feature_logits(model: CNN, images: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    features = model.extract_features(images)
+    logits = model.l_c1(features)
+    if model.top_bn:
+        logits = model.bn_c1(logits)
+    return features, logits
+
+
+def run_alignment_diagnostics(
+    epoch: int,
+    args,
+    models: List[torch.nn.Module],
+    optimizers: List[torch.optim.Optimizer],
+    train_loader,
+    val_loader,
+    base_train_dataset,
+    num_classes: int,
+    remember_rate: float,
+    active_mask: List[bool],
+) -> Dict:
+    if val_loader is None:
+        return {}
+
+    ensure_dir(args.diag_output_dir)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    was_training = [model.training for model in models]
+    for model in models:
+        model.eval()
+
+    val_images_parts = []
+    val_noisy_parts = []
+    val_clean_parts = []
+    with torch.no_grad():
+        for batch_idx, (images, labels, indices) in enumerate(val_loader):
+            if batch_idx >= args.diag_val_batches:
+                break
+            idx_np = indices.numpy().astype(np.int64)
+            val_images_parts.append(images.to(device, non_blocking=True))
+            val_noisy_parts.append(labels.to(device, non_blocking=True).long())
+            clean_np = get_clean_labels(base_train_dataset, idx_np)
+            val_clean_parts.append(torch.tensor(clean_np, device=device, dtype=torch.long))
+
+    if not val_images_parts:
+        for model, training in zip(models, was_training):
+            model.train(training)
+        return {}
+
+    val_images = torch.cat(val_images_parts, dim=0)
+    val_noisy_labels = torch.cat(val_noisy_parts, dim=0)
+    val_clean_labels = torch.cat(val_clean_parts, dim=0)
+    target_labels = {}
+    if args.diag_target in ("clean", "both"):
+        target_labels["clean"] = val_clean_labels
+    if args.diag_target in ("noisy", "both"):
+        target_labels["noisy"] = val_noisy_labels
+
+    active_mask_tensor = torch.tensor(active_mask, device=device, dtype=torch.bool)
+    target_cache: Dict[Tuple[int, str], Tuple[torch.Tensor, torch.Tensor]] = {}
+    with torch.no_grad():
+        for m_idx, model in enumerate(models):
+            val_features, val_logits = _feature_logits(model, val_images)
+            for target_name, labels in target_labels.items():
+                target_cache[(m_idx, target_name)] = (
+                    val_features.detach(),
+                    last_layer_error(val_logits, labels).detach(),
+                )
+
+    records = []
+    per_target_values: Dict[str, Dict[str, List[float]]] = {
+        target_name: {
+            "loss": [],
+            "align_raw": [],
+            "align_adam": [],
+            "clean": [],
+            "selected": [],
+        }
+        for target_name in target_labels
+    }
+
+    with torch.no_grad():
+        for batch_idx, (images, labels, indices) in enumerate(train_loader):
+            if batch_idx >= args.diag_batches:
+                break
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True).long()
+            indices = indices.to(device, non_blocking=True)
+            idx_np = indices.detach().cpu().numpy().astype(np.int64)
+            noisy_np = labels.detach().cpu().numpy().astype(np.int64)
+            clean_np = get_clean_labels(base_train_dataset, idx_np)
+            clean_flags = get_clean_mask(base_train_dataset, idx_np, noisy_np)
+
+            logits_list = [model(images) for model in models]
+            loss_stack = torch.stack([F.cross_entropy(logits, labels, reduction="none") for logits in logits_list])
+            for m_idx, model in enumerate(models):
+                agg_loss = aggregate_losses(loss_stack, m_idx, active_mask_tensor, mode=args.aggregation)
+                k = max(1, int(math.ceil(remember_rate * labels.size(0))))
+                k = min(k, labels.size(0))
+                selected = torch.topk(agg_loss, k, largest=False).indices
+                selected_mask = torch.zeros(labels.size(0), device=device, dtype=torch.bool)
+                selected_mask[selected] = True
+
+                train_features, train_logits = _feature_logits(model, images)
+                train_errors = last_layer_error(train_logits, labels)
+                denom_w, denom_b = adam_last_layer_denominators(model, optimizers[m_idx])
+                for target_name in target_labels:
+                    val_features, val_errors = target_cache[(m_idx, target_name)]
+                    raw_scores, adam_scores = alignment_scores(
+                        train_features,
+                        train_errors,
+                        val_features,
+                        val_errors,
+                        denom_w,
+                        denom_b,
+                    )
+                    loss_np = agg_loss.detach().cpu().numpy().astype(float)
+                    raw_np = raw_scores.detach().cpu().numpy().astype(float)
+                    adam_np = adam_scores.detach().cpu().numpy().astype(float)
+                    selected_np = selected_mask.detach().cpu().numpy().astype(bool)
+
+                    store = per_target_values[target_name]
+                    store["loss"].extend(loss_np.tolist())
+                    store["align_raw"].extend(raw_np.tolist())
+                    store["align_adam"].extend(adam_np.tolist())
+                    store["clean"].extend(clean_flags.astype(float).tolist())
+                    store["selected"].extend(selected_np.astype(float).tolist())
+
+                    for local_idx in range(labels.size(0)):
+                        records.append(
+                            {
+                                "epoch": int(epoch),
+                                "batch": int(batch_idx),
+                                "model": int(m_idx),
+                                "target": target_name,
+                                "index": int(idx_np[local_idx]),
+                                "noisy_label": int(noisy_np[local_idx]),
+                                "clean_label": int(clean_np[local_idx]),
+                                "is_clean": bool(clean_flags[local_idx]),
+                                "loss": float(loss_np[local_idx]),
+                                "small_loss_selected": bool(selected_np[local_idx]),
+                                "align_raw": float(raw_np[local_idx]),
+                                "align_adam": float(adam_np[local_idx]),
+                            }
+                        )
+
+    summaries = {}
+    for target_name, values in per_target_values.items():
+        loss = np.asarray(values["loss"], dtype=np.float64)
+        align_raw = np.asarray(values["align_raw"], dtype=np.float64)
+        align_adam = np.asarray(values["align_adam"], dtype=np.float64)
+        clean = np.asarray(values["clean"], dtype=bool)
+        selected = np.asarray(values["selected"], dtype=bool)
+        if loss.size == 0:
+            continue
+        loss_low = loss <= np.quantile(loss, 0.25)
+        loss_high = loss >= np.quantile(loss, 0.75)
+        align_high = align_adam >= np.quantile(align_adam, 0.75)
+        align_low = align_adam <= np.quantile(align_adam, 0.25)
+        summaries[target_name] = {
+            "epoch": int(epoch),
+            "target": target_name,
+            "num_records": int(loss.size),
+            "auc_loss_clean": binary_auc(-loss, clean),
+            "auc_align_raw_clean": binary_auc(align_raw, clean),
+            "auc_align_adam_clean": binary_auc(align_adam, clean),
+            "selected_clean_rate": _clean_rate(selected, clean),
+            "high_align_clean_rate": _clean_rate(align_high, clean),
+            "high_loss_high_align_clean_rate": _clean_rate(loss_high & align_high, clean),
+            "low_loss_high_align_clean_rate": _clean_rate(loss_low & align_high, clean),
+            "low_loss_low_align_clean_rate": _clean_rate(loss_low & align_low, clean),
+            "high_loss_low_align_clean_rate": _clean_rate(loss_high & align_low, clean),
+            "mean_loss_clean": _safe_mean(loss[clean]),
+            "mean_loss_noisy": _safe_mean(loss[~clean]),
+            "mean_align_adam_clean": _safe_mean(align_adam[clean]),
+            "mean_align_adam_noisy": _safe_mean(align_adam[~clean]),
+        }
+
+    summary_path = os.path.join(args.diag_output_dir, "alignment_summary.jsonl")
+    samples_path = os.path.join(args.diag_output_dir, f"alignment_epoch_{epoch:04d}.jsonl")
+    with open(summary_path, "a") as f:
+        for target_name in sorted(summaries):
+            f.write(json.dumps(summaries[target_name]) + "\n")
+    with open(samples_path, "w") as f:
+        for record in records:
+            f.write(json.dumps(record) + "\n")
+
+    for model, training in zip(models, was_training):
+        model.train(training)
+    return {"alignment": summaries, "sample_file": samples_path, "summary_file": summary_path}
+
+
 def load_datasets(args) -> Tuple:
     if args.dataset == "mnist":
         input_channel = 1
         num_classes = 10
         args.top_bn = False
         args.epoch_decay_start = 80
-        args.n_epoch = max(args.n_epoch, 200)
         train_dataset = MNIST(
             root="./data/",
             download=True,
@@ -460,7 +772,6 @@ def load_datasets(args) -> Tuple:
         num_classes = 10
         args.top_bn = False
         args.epoch_decay_start = 80
-        args.n_epoch = max(args.n_epoch, 200)
         train_dataset = CIFAR10(
             root="./data/",
             download=True,
@@ -482,7 +793,6 @@ def load_datasets(args) -> Tuple:
         num_classes = 100
         args.top_bn = False
         args.epoch_decay_start = 100
-        args.n_epoch = max(args.n_epoch, 200)
         train_dataset = CIFAR100(
             root="./data/",
             download=True,
@@ -906,6 +1216,17 @@ def main():
         shuffle=True,
         **loader_kwargs,
     )
+    diag_train_loader = None
+    if args.diag_alignment:
+        diag_loader_kwargs = dict(loader_kwargs)
+        if args.num_workers > 0:
+            diag_loader_kwargs["persistent_workers"] = False
+        diag_train_loader = torch.utils.data.DataLoader(
+            dataset=train_dataset,
+            drop_last=args.drop_last,
+            shuffle=False,
+            **diag_loader_kwargs,
+        )
     val_loader = None
     if val_dataset is not None:
         val_loader = torch.utils.data.DataLoader(
@@ -1059,6 +1380,27 @@ def main():
             if bad_counts[i] >= args.lambda_patience:
                 if sum(active_mask) > args.min_active:
                     active_mask[i] = False
+        diag_log = {}
+        if (
+            args.diag_alignment
+            and val_loader is not None
+            and args.diag_every_epoch > 0
+            and epoch % args.diag_every_epoch == 0
+        ):
+            diag_log = run_alignment_diagnostics(
+                epoch,
+                args,
+                models,
+                optimizers,
+                diag_train_loader,
+                val_loader,
+                base_train_dataset,
+                num_classes,
+                remember_rate,
+                active_mask,
+            )
+            if diag_log:
+                print(f"Diagnostics saved: {diag_log.get('summary_file', '')}")
         print(
                         f"Epoch [{epoch}/{args.n_epoch}] "
             + " ".join([f"TrainAcc_M{i}:{train_metrics[f'train_acc_{i}']:.2f}%" for i in range(args.num_models)])
@@ -1105,6 +1447,7 @@ def main():
             "replay_candidates": train_metrics.get("replay_candidates", 0),
             "replay_admissions": train_metrics.get("replay_admissions", 0),
             "replay_evictions": train_metrics.get("replay_evictions", 0),
+            "diagnostics": diag_log,
         }
         training_log["epochs"].append(epoch_log)
         
