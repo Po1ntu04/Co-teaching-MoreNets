@@ -3,6 +3,7 @@ param(
     [string]$CommitMessage = "exp: stage1 target utility diagnostic",
     [string]$LocalPython = "",
     [int]$PollSeconds = 120,
+    [int]$MaxRuns = 0,
     [switch]$SkipGitSync,
     [switch]$SmokeOnly,
     [switch]$NoWait
@@ -439,6 +440,7 @@ if (-not $SmokeOnly) {
     }
 }
 
+$startedRuns = 0
 foreach ($run in $runs) {
     Write-Host "== start $($run.Name) =="
     $localRunRoot = Join-Path $localResultRoot $run.Name
@@ -447,7 +449,12 @@ foreach ($run in $runs) {
         Write-Host "Skipping already audited run: $($run.Name)"
         continue
     }
+    if ($MaxRuns -gt 0 -and $startedRuns -ge $MaxRuns) {
+        Write-Host "Reached MaxRuns=$MaxRuns; stopping before $($run.Name)."
+        break
+    }
     Start-RemoteRun -Config $config -Target $target -Session $run.Session -LogFile $run.Log -RunCommand $run.Command
+    $startedRuns += 1
     if (-not $NoWait) {
         Wait-RemoteRun -Config $config -Target $target -Session $run.Session -LogFile $run.Log -PollSeconds $PollSeconds
         Copy-RemoteResults -Config $config -Target $target -RemotePath "$($config.RepoDir)/$($run.Result)" -LocalPath $localRunRoot
