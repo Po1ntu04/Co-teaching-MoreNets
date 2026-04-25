@@ -149,52 +149,53 @@ function Get-RemoteGpuSelection {
     )
     $script = @'
 set -euo pipefail
-python - <<'PY'
-import csv
-import subprocess
-import sys
-
-rows = subprocess.check_output([
-    "nvidia-smi",
-    "--query-gpu=index,name,memory.used,memory.total,utilization.gpu",
-    "--format=csv,noheader,nounits",
-], text=True)
-
-gpus = []
-for row in csv.reader(rows.splitlines()):
-    if len(row) < 5:
-        continue
-    idx = int(row[0].strip())
-    name = row[1].strip()
-    used = int(row[2].strip())
-    total = int(row[3].strip())
-    util = int(row[4].strip())
-    if "4090" in name:
-        priority = 0
-    elif "3090" in name:
-        priority = 1
-    elif "3080 Ti" in name or "3080Ti" in name:
-        priority = 2
-    else:
-        priority = 3
-    free = used < 1500 and util < 20
-    gpus.append((priority, idx, name, used, total, util, free))
-
-free_gpus = [item for item in gpus if item[-1]]
-if not free_gpus:
-    print("NO_FREE_GPU")
-    for item in sorted(gpus):
-        print(f"GPU {item[1]} {item[2]} used={item[3]}MiB total={item[4]}MiB util={item[5]}% free={item[6]}")
-    sys.exit(2)
-
-chosen = sorted(free_gpus)[0]
-batch_e1 = 192 if chosen[0] == 2 else 384
-batch_e2 = 160 if chosen[0] == 2 else 320
-print(f"{chosen[1]},{chosen[2]},{batch_e1},{batch_e2}")
-PY
+nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits
 '@
     $output = Invoke-Stage1RemoteScript -Config $Config -Target $Target -Script $script -CaptureOutput
-    return ($output | Select-Object -Last 1).Trim()
+    $gpus = @()
+    foreach ($line in $output) {
+        $parts = ([string]$line).Split(",", 5)
+        if ($parts.Length -lt 5) {
+            continue
+        }
+        $name = $parts[1].Trim()
+        $priority = 3
+        if ($name -match "4090") {
+            $priority = 0
+        }
+        elseif ($name -match "3090") {
+            $priority = 1
+        }
+        elseif ($name -match "3080 Ti|3080Ti") {
+            $priority = 2
+        }
+        $used = [int]$parts[2].Trim()
+        $util = [int]$parts[4].Trim()
+        $free = ($used -lt 1500 -and $util -lt 20)
+        $gpus += [pscustomobject]@{
+            Priority = $priority
+            Index = [int]$parts[0].Trim()
+            Name = $name
+            Used = $used
+            Total = [int]$parts[3].Trim()
+            Util = $util
+            Free = $free
+        }
+    }
+    $candidate = $gpus | Where-Object { $_.Free } | Sort-Object Priority, Index | Select-Object -First 1
+    if (-not $candidate) {
+        $summary = ($gpus | Sort-Object Priority, Index | ForEach-Object {
+            "GPU $($_.Index) $($_.Name) used=$($_.Used)MiB total=$($_.Total)MiB util=$($_.Util)% free=$($_.Free)"
+        }) -join "`n"
+        throw "No free GPU under threshold.`n$summary"
+    }
+    $batchE1 = 384
+    $batchE2 = 320
+    if ($candidate.Priority -eq 2) {
+        $batchE1 = 192
+        $batchE2 = 160
+    }
+    return "$($candidate.Index),$($candidate.Name),$batchE1,$batchE2"
 }
 
 function Invoke-RemotePrecheck {
