@@ -137,6 +137,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--q_weight_min", type=float, default=0.05, help="minimum clipped Q weight")
     parser.add_argument("--q_weight_max", type=float, default=0.95, help="maximum clipped Q weight")
     # ------------------------------------------------------------------------
+    # Stage-2 reliability-gated utility weighting. Utility is applied only
+    # inside peer-selected samples; it is not a clean posterior.
+    parser.add_argument(
+        "--utility_mode",
+        type=str,
+        default="none",
+        choices=["none", "sam_gap"],
+        help="sample utility weighting inside selected samples",
+    )
+    parser.add_argument("--utility_strength", type=float, default=1.0, help="blend strength for utility weights")
+    parser.add_argument("--utility_temp", type=float, default=1.0, help="temperature for standardized utility gap")
+    parser.add_argument("--utility_min", type=float, default=0.2, help="minimum utility multiplier")
+    parser.add_argument("--utility_max", type=float, default=2.0, help="maximum utility multiplier")
+    # ------------------------------------------------------------------------
     # Replay buffer (stream-like stability)
     parser.add_argument("--replay_size", type=int, default=2000, help="max replay buffer size")
     parser.add_argument("--replay_candidate_size", type=int, default=4000, help="candidate buffer size for purified replay")
@@ -423,6 +437,84 @@ def standard_update(
     optimizer.step()
     loss_value = loss.item()
     return loss_value, loss_value
+
+
+def sam_gap_weighted_update(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    images: torch.Tensor,
+    labels: torch.Tensor,
+    hard_selection: torch.Tensor,
+    student_weight: float,
+    rho: float,
+    args,
+) -> Tuple[float, float, float, float, float]:
+    """
+    SAM update with utility weighting restricted to peer-selected samples.
+    The utility signal is the per-sample sharpness gap under the SAM
+    perturbation. Smaller gap means a more stable selected sample.
+    """
+    selected = hard_selection.float().detach()
+    denom = selected.sum().clamp(min=1.0)
+    optimizer.zero_grad()
+    clean_logits = model(images)
+    clean_losses = F.cross_entropy(clean_logits, labels, reduction="none")
+    clean_loss = student_weight * (clean_losses * selected).sum() / denom
+    clean_loss.backward()
+
+    grad_parts = [p.grad.view(-1) for p in model.parameters() if p.grad is not None]
+    if not grad_parts:
+        optimizer.zero_grad()
+        loss_value = clean_loss.item()
+        return loss_value, loss_value, 1.0, 0.0, 0.0
+
+    grad_norm = torch.norm(torch.cat(grad_parts), p=2)
+    scale = rho / (grad_norm + 1e-12)
+    e_ws: List[torch.Tensor] = []
+    with torch.no_grad():
+        for p in model.parameters():
+            if p.grad is None:
+                e_ws.append(None)
+                continue
+            e_w = p.grad * scale
+            p.add_(e_w)
+            e_ws.append(e_w)
+
+    optimizer.zero_grad()
+    perturbed_logits = model(images)
+    perturbed_losses = F.cross_entropy(perturbed_logits, labels, reduction="none")
+    gap = (perturbed_losses - clean_losses.detach()).detach()
+    selected_mask = selected > 0
+    if selected_mask.any():
+        selected_gap = gap[selected_mask]
+        centered = selected_gap - selected_gap.mean()
+        scale_gap = selected_gap.std(unbiased=False).clamp(min=1e-6) * max(args.utility_temp, 1e-6)
+        utility_selected = torch.sigmoid(-centered / scale_gap) * 2.0
+        utility_selected = utility_selected.clamp(args.utility_min, args.utility_max)
+        utility_selected = utility_selected / utility_selected.mean().clamp(min=1e-6)
+        if args.utility_strength < 1.0:
+            utility_selected = (1.0 - args.utility_strength) + args.utility_strength * utility_selected
+        utility = torch.zeros_like(selected)
+        utility[selected_mask] = utility_selected
+        utility_mean = float(utility_selected.mean().item())
+        utility_std = float(utility_selected.std(unbiased=False).item())
+        gap_mean = float(selected_gap.mean().item())
+    else:
+        utility = selected
+        utility_mean = 1.0
+        utility_std = 0.0
+        gap_mean = 0.0
+
+    weights = selected * utility.detach()
+    perturbed_loss = student_weight * (perturbed_losses * weights).sum() / (weights.sum().clamp(min=1e-12))
+    perturbed_loss.backward()
+    with torch.no_grad():
+        for p, e_w in zip(model.parameters(), e_ws):
+            if e_w is None:
+                continue
+            p.sub_(e_w)
+    optimizer.step()
+    return clean_loss.item(), perturbed_loss.item(), utility_mean, utility_std, gap_mean
 
 
 def evaluate_models(models: List[torch.nn.Module], loader) -> Tuple[List[float], float]:
@@ -899,6 +991,9 @@ def train_epoch(
         "disagreement": [0.0 for _ in models],
         "stability": [0.0 for _ in models],
         "memory_alignment": [0.0 for _ in models],
+        "utility_weight_mean": [0.0 for _ in models],
+        "utility_weight_std": [0.0 for _ in models],
+        "utility_gap_mean": [0.0 for _ in models],
         "q_mean": [],
         "q_std": [],
         "overlap": [],
@@ -1114,7 +1209,21 @@ def train_epoch(
                     args,
                 )
 
-            if args.sam_rho > 0:
+            if args.utility_mode == "sam_gap" and args.sam_rho > 0 and args.mstep_mode == "hard":
+                clean_loss, perturbed_loss, utility_mean, utility_std, utility_gap_mean = sam_gap_weighted_update(
+                    model,
+                    optimizer,
+                    images,
+                    labels,
+                    hard_selection,
+                    student_weight,
+                    rho=args.sam_rho,
+                    args=args,
+                )
+                batch_accumulator["utility_weight_mean"][m_idx] += utility_mean
+                batch_accumulator["utility_weight_std"][m_idx] += utility_std
+                batch_accumulator["utility_gap_mean"][m_idx] += utility_gap_mean
+            elif args.sam_rho > 0:
                 clean_loss, perturbed_loss = sam_update(
                     model,
                     optimizer,
@@ -1160,6 +1269,9 @@ def train_epoch(
         metrics[f"clean_loss_{m_idx}"] = batch_accumulator["clean_loss"][m_idx] / max(1, num_batches)
         metrics[f"sharp_loss_{m_idx}"] = batch_accumulator["sharp_loss"][m_idx] / max(1, num_batches)
         metrics[f"sharp_gap_{m_idx}"] = batch_accumulator["sharp_gap"][m_idx] / max(1, num_batches)
+        metrics[f"utility_weight_mean_{m_idx}"] = batch_accumulator["utility_weight_mean"][m_idx] / max(1, num_batches)
+        metrics[f"utility_weight_std_{m_idx}"] = batch_accumulator["utility_weight_std"][m_idx] / max(1, num_batches)
+        metrics[f"utility_gap_mean_{m_idx}"] = batch_accumulator["utility_gap_mean"][m_idx] / max(1, num_batches)
         metrics[f"disagreement_{m_idx}"] = batch_accumulator["disagreement"][m_idx] / max(1, num_batches)
         metrics[f"stability_{m_idx}"] = batch_accumulator["stability"][m_idx] / max(1, num_batches)
         metrics[f"memory_alignment_{m_idx}"] = batch_accumulator["memory_alignment"][m_idx] / max(1, num_batches)
@@ -1473,6 +1585,15 @@ def main():
             "replay_size": replay_size_for_log,
             "test_accs_per_model": test_accs,
             "reliability": reliability,
+            "utility_weight_mean": sum(
+                train_metrics.get(f"utility_weight_mean_{i}", 0.0) for i in range(args.num_models)
+            ) / args.num_models,
+            "utility_weight_std": sum(
+                train_metrics.get(f"utility_weight_std_{i}", 0.0) for i in range(args.num_models)
+            ) / args.num_models,
+            "utility_gap_mean": sum(
+                train_metrics.get(f"utility_gap_mean_{i}", 0.0) for i in range(args.num_models)
+            ) / args.num_models,
             # BMM and purified replay metrics
             "bmm_fitted": train_metrics.get("bmm_fitted", 0.0),
             "bmm_weight_clean": train_metrics.get("bmm_weight_clean", 0.0),
