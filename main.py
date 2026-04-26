@@ -23,6 +23,9 @@ from utils.replay import PurifiedReplayBuffer
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--lr", type=float, default=0.001)
+    parser.add_argument("--optimizer", type=str, default="adam", choices=["adam", "sgd"])
+    parser.add_argument("--momentum", type=float, default=0.9, help="SGD momentum")
+    parser.add_argument("--weight_decay", type=float, default=0.0, help="optimizer weight decay")
     parser.add_argument("--result_dir", type=str, default="results/", help="dir to save result txt files")
     parser.add_argument("--noise_rate", type=float, default=0.2, help="corruption rate, should be less than 1")
     parser.add_argument("--forget_rate", type=float, default=None, help="forget rate")
@@ -232,7 +235,21 @@ def compute_rate_schedule(
 def adjust_learning_rate(optimizer: torch.optim.Optimizer, alpha_plan: Sequence[float], beta1_plan: Sequence[float], epoch: int) -> None:
     for param_group in optimizer.param_groups:
         param_group["lr"] = alpha_plan[epoch]
-        param_group["betas"] = (beta1_plan[epoch], 0.999)  # Only change beta1
+        if "betas" in param_group:
+            param_group["betas"] = (beta1_plan[epoch], 0.999)  # Only change beta1 for Adam.
+
+
+def build_optimizer(args, model: torch.nn.Module) -> torch.optim.Optimizer:
+    if args.optimizer == "adam":
+        return torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.optimizer == "sgd":
+        return torch.optim.SGD(
+            model.parameters(),
+            lr=args.lr,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+        )
+    raise ValueError(f"Unsupported optimizer: {args.optimizer}")
 
 
 def top1_accuracy(logits: torch.Tensor, labels: torch.Tensor) -> float:
@@ -394,6 +411,18 @@ def sam_update(
             p.sub_(e_w)
     optimizer.step()
     return clean_loss.item(), perturbed_loss.item()
+
+
+def standard_update(
+    optimizer: torch.optim.Optimizer,
+    loss_builder,
+) -> Tuple[float, float]:
+    optimizer.zero_grad()
+    loss = loss_builder()
+    loss.backward()
+    optimizer.step()
+    loss_value = loss.item()
+    return loss_value, loss_value
 
 
 def evaluate_models(models: List[torch.nn.Module], loader) -> Tuple[List[float], float]:
@@ -1085,12 +1114,15 @@ def train_epoch(
                     args,
                 )
 
-            clean_loss, perturbed_loss = sam_update(
-                model,
-                optimizer,
-                loss_builder,
-                rho=args.sam_rho,
-            )
+            if args.sam_rho > 0:
+                clean_loss, perturbed_loss = sam_update(
+                    model,
+                    optimizer,
+                    loss_builder,
+                    rho=args.sam_rho,
+                )
+            else:
+                clean_loss, perturbed_loss = standard_update(optimizer, loss_builder)
             batch_accumulator["clean_loss"][m_idx] += clean_loss
             batch_accumulator["sharp_loss"][m_idx] += perturbed_loss
             batch_accumulator["sharp_gap"][m_idx] += max(0.0, perturbed_loss - clean_loss)
@@ -1252,7 +1284,7 @@ def main():
         net = CNN(input_channel=input_channel, n_outputs=num_classes)
         net.cuda()
         models.append(net)
-        optimizers.append(torch.optim.Adam(net.parameters(), lr=learning_rate))
+        optimizers.append(build_optimizer(args, net))
     teacher_models = build_teacher_models(models)
 
     # Prepare logging
