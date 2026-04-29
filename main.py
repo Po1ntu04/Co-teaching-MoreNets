@@ -228,6 +228,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="results_diag/stage1_probe",
         help="directory for diagnostic JSON/JSONL outputs",
     )
+    # ------------------------------------------------------------------------
+    # Stage-2 oracle diagnostics. These options only add logging and do not
+    # change model updates. The oracle freezes features and measures the actual
+    # validation-loss improvement from a one-step last-layer update per sample.
+    parser.add_argument("--diag_oracle", action="store_true", help="enable one-step utility oracle diagnostics")
+    parser.add_argument("--diag_oracle_every_epoch", type=int, default=5, help="run oracle diagnostics every N epochs")
+    parser.add_argument("--diag_oracle_batches", type=int, default=2, help="number of train batches for oracle diagnostics")
+    parser.add_argument("--diag_oracle_val_batches", type=int, default=1, help="number of validation batches for oracle diagnostics")
+    parser.add_argument(
+        "--diag_oracle_candidates",
+        type=int,
+        default=128,
+        help="max peer-selected candidates per model/batch for oracle scoring",
+    )
+    parser.add_argument(
+        "--diag_oracle_target",
+        type=str,
+        default="both",
+        choices=["clean", "noisy", "both"],
+        help="validation target labels used by the oracle",
+    )
+    parser.add_argument(
+        "--diag_oracle_lr",
+        type=float,
+        default=0.0,
+        help="last-layer oracle step size; 0 uses the current optimizer lr",
+    )
+    parser.add_argument(
+        "--diag_oracle_output_dir",
+        type=str,
+        default="results_diag/stage2_oracle",
+        help="directory for oracle diagnostic JSON/JSONL outputs",
+    )
     return parser
 
 
@@ -638,6 +671,70 @@ def _clean_rate(mask: np.ndarray, clean_flags: np.ndarray) -> float:
     return float(np.asarray(clean_flags, dtype=bool)[mask].mean())
 
 
+def _finite_pair(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    valid = np.isfinite(x) & np.isfinite(y)
+    return x[valid], y[valid]
+
+
+def pearson_corr(x: np.ndarray, y: np.ndarray) -> float:
+    x, y = _finite_pair(x, y)
+    if x.size < 2:
+        return float("nan")
+    x = x - x.mean()
+    y = y - y.mean()
+    denom = float(np.sqrt((x * x).sum() * (y * y).sum()))
+    if denom <= 1e-12:
+        return float("nan")
+    return float((x * y).sum() / denom)
+
+
+def rankdata_average(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    order = np.argsort(values)
+    sorted_values = values[order]
+    ranks = np.empty_like(sorted_values, dtype=np.float64)
+    start = 0
+    while start < sorted_values.size:
+        end = start + 1
+        while end < sorted_values.size and sorted_values[end] == sorted_values[start]:
+            end += 1
+        ranks[start:end] = 0.5 * (start + end - 1) + 1.0
+        start = end
+    original = np.empty_like(ranks)
+    original[order] = ranks
+    return original
+
+
+def spearman_corr(x: np.ndarray, y: np.ndarray) -> float:
+    x, y = _finite_pair(x, y)
+    if x.size < 2:
+        return float("nan")
+    return pearson_corr(rankdata_average(x), rankdata_average(y))
+
+
+def top_fraction_mask(scores: np.ndarray, fraction: float = 0.25) -> np.ndarray:
+    scores = np.asarray(scores, dtype=np.float64)
+    mask = np.zeros(scores.shape[0], dtype=bool)
+    valid = np.isfinite(scores)
+    valid_count = int(valid.sum())
+    if valid_count == 0:
+        return mask
+    k = max(1, int(math.ceil(valid_count * fraction)))
+    valid_indices = np.where(valid)[0]
+    order = valid_indices[np.argsort(scores[valid_indices])[::-1]]
+    mask[order[:k]] = True
+    return mask
+
+
+def _safe_auc(scores: np.ndarray, labels: np.ndarray) -> float:
+    try:
+        return binary_auc(scores, labels)
+    except Exception:
+        return float("nan")
+
+
 def last_layer_error(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     probs = logits.softmax(dim=1)
     return probs - F.one_hot(labels, num_classes=logits.size(1)).to(dtype=probs.dtype)
@@ -684,6 +781,100 @@ def _feature_logits(model: CNN, images: torch.Tensor) -> Tuple[torch.Tensor, tor
     if model.top_bn:
         logits = model.bn_c1(logits)
     return features, logits
+
+
+def diagnostic_sam_gap_scores(
+    model: torch.nn.Module,
+    images: torch.Tensor,
+    labels: torch.Tensor,
+    hard_selection: torch.Tensor,
+    rho: float,
+) -> torch.Tensor:
+    """
+    Non-updating SAM gap diagnostic. Returns per-sample
+    loss(theta + epsilon_sam) - loss(theta), then restores parameters.
+    """
+    if rho <= 0:
+        return torch.zeros(labels.size(0), device=labels.device, dtype=torch.float32)
+
+    selected = hard_selection.float().detach()
+    denom = selected.sum().clamp(min=1.0)
+    model.zero_grad()
+    clean_logits = model(images)
+    clean_losses = F.cross_entropy(clean_logits, labels, reduction="none")
+    clean_loss = (clean_losses * selected).sum() / denom
+    clean_loss.backward()
+
+    grad_parts = [p.grad.view(-1) for p in model.parameters() if p.grad is not None]
+    if not grad_parts:
+        model.zero_grad()
+        return torch.zeros(labels.size(0), device=labels.device, dtype=torch.float32)
+
+    grad_norm = torch.norm(torch.cat(grad_parts), p=2)
+    scale = rho / (grad_norm + 1e-12)
+    e_ws: List[torch.Tensor] = []
+    with torch.no_grad():
+        for p in model.parameters():
+            if p.grad is None:
+                e_ws.append(None)
+                continue
+            e_w = p.grad * scale
+            p.add_(e_w)
+            e_ws.append(e_w)
+
+    with torch.no_grad():
+        perturbed_logits = model(images)
+        perturbed_losses = F.cross_entropy(perturbed_logits, labels, reduction="none")
+        gap = perturbed_losses - clean_losses.detach()
+        for p, e_w in zip(model.parameters(), e_ws):
+            if e_w is not None:
+                p.sub_(e_w)
+    model.zero_grad()
+    return gap.detach()
+
+
+def last_layer_one_step_improvement(
+    model: CNN,
+    train_features: torch.Tensor,
+    train_errors: torch.Tensor,
+    val_features: torch.Tensor,
+    val_logits: torch.Tensor,
+    val_labels: torch.Tensor,
+    step_size: float,
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    """
+    Frozen-feature oracle: for each candidate training sample, simulate one
+    last-layer SGD step and measure validation CE improvement.
+
+    Positive value means the candidate update lowers validation loss.
+    """
+    if train_features.numel() == 0:
+        return torch.empty(0, device=val_logits.device, dtype=val_logits.dtype)
+
+    base_loss = F.cross_entropy(val_logits, val_labels, reduction="mean").detach()
+    improvements = []
+    val_labels_repeated_cache = {}
+    use_bias = model.l_c1.bias is not None
+    for start in range(0, train_features.size(0), chunk_size):
+        end = min(start + chunk_size, train_features.size(0))
+        feat_chunk = train_features[start:end]
+        err_chunk = train_errors[start:end]
+        feature_dot = torch.matmul(feat_chunk, val_features.t())
+        if use_bias:
+            feature_dot = feature_dot + 1.0
+        updated_logits = val_logits.unsqueeze(0) - float(step_size) * feature_dot.unsqueeze(2) * err_chunk.unsqueeze(1)
+        flat_logits = updated_logits.reshape(-1, updated_logits.size(-1))
+        n_candidates = end - start
+        if n_candidates not in val_labels_repeated_cache:
+            val_labels_repeated_cache[n_candidates] = val_labels.repeat(n_candidates)
+        losses = F.cross_entropy(
+            flat_logits,
+            val_labels_repeated_cache[n_candidates],
+            reduction="none",
+        ).view(n_candidates, val_labels.size(0)).mean(dim=1)
+        improvements.append(base_loss - losses)
+    return torch.cat(improvements, dim=0).detach()
 
 
 def run_alignment_diagnostics(
@@ -866,6 +1057,257 @@ def run_alignment_diagnostics(
     for model, training in zip(models, was_training):
         model.train(training)
     return {"alignment": summaries, "sample_file": samples_path, "summary_file": summary_path}
+
+
+def run_utility_oracle_diagnostics(
+    epoch: int,
+    args,
+    models: List[torch.nn.Module],
+    optimizers: List[torch.optim.Optimizer],
+    train_loader,
+    val_loader,
+    base_train_dataset,
+    remember_rate: float,
+    active_mask: List[bool],
+) -> Dict:
+    """
+    Stage-2 diagnostic: inside the peer-selected reliable set, compare cheap
+    utility proxies against a frozen-feature one-step validation oracle.
+    This function never calls optimizer.step().
+    """
+    if train_loader is None or val_loader is None:
+        return {}
+
+    ensure_dir(args.diag_oracle_output_dir)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    was_training = [model.training for model in models]
+    for model in models:
+        model.eval()
+
+    val_images_parts = []
+    val_noisy_parts = []
+    val_clean_parts = []
+    with torch.no_grad():
+        for batch_idx, (images, labels, indices) in enumerate(val_loader):
+            if batch_idx >= args.diag_oracle_val_batches:
+                break
+            idx_np = indices.numpy().astype(np.int64)
+            val_images_parts.append(images.to(device, non_blocking=True))
+            val_noisy_parts.append(labels.to(device, non_blocking=True).long())
+            clean_np = get_clean_labels(base_train_dataset, idx_np)
+            val_clean_parts.append(torch.tensor(clean_np, device=device, dtype=torch.long))
+
+    if not val_images_parts:
+        for model, training in zip(models, was_training):
+            model.train(training)
+        return {}
+
+    val_images = torch.cat(val_images_parts, dim=0)
+    val_noisy_labels = torch.cat(val_noisy_parts, dim=0)
+    val_clean_labels = torch.cat(val_clean_parts, dim=0)
+    target_labels = {}
+    if args.diag_oracle_target in ("clean", "both"):
+        target_labels["clean"] = val_clean_labels
+    if args.diag_oracle_target in ("noisy", "both"):
+        target_labels["noisy"] = val_noisy_labels
+
+    active_mask_tensor = torch.tensor(active_mask, device=device, dtype=torch.bool)
+    val_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+    with torch.no_grad():
+        for m_idx, model in enumerate(models):
+            val_features, val_logits = _feature_logits(model, val_images)
+            val_cache[m_idx] = (val_features.detach(), val_logits.detach())
+
+    records = []
+    per_target_values: Dict[str, Dict[str, List[float]]] = {
+        target_name: {
+            "oracle": [],
+            "neg_loss": [],
+            "sam_utility": [],
+            "align_raw": [],
+            "align_adam": [],
+            "clean": [],
+        }
+        for target_name in target_labels
+    }
+
+    for batch_idx, (images, labels, indices) in enumerate(train_loader):
+        if batch_idx >= args.diag_oracle_batches:
+            break
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True).long()
+        indices = indices.to(device, non_blocking=True)
+        idx_np = indices.detach().cpu().numpy().astype(np.int64)
+        noisy_np = labels.detach().cpu().numpy().astype(np.int64)
+        clean_np = get_clean_labels(base_train_dataset, idx_np)
+        clean_flags = get_clean_mask(base_train_dataset, idx_np, noisy_np)
+
+        with torch.no_grad():
+            logits_list = [model(images) for model in models]
+            loss_stack = torch.stack([F.cross_entropy(logits, labels, reduction="none") for logits in logits_list])
+
+        for m_idx, model in enumerate(models):
+            agg_loss = aggregate_losses(loss_stack, m_idx, active_mask_tensor, mode=args.aggregation)
+            k = max(1, int(math.ceil(remember_rate * labels.size(0))))
+            k = min(k, labels.size(0))
+            selected = torch.topk(agg_loss, k, largest=False).indices
+            selected_sorted = selected[torch.argsort(agg_loss[selected])]
+            if args.diag_oracle_candidates > 0 and selected_sorted.numel() > args.diag_oracle_candidates:
+                pick = torch.linspace(
+                    0,
+                    selected_sorted.numel() - 1,
+                    steps=args.diag_oracle_candidates,
+                    device=selected_sorted.device,
+                ).round().long()
+                selected_sorted = selected_sorted[pick].unique()
+
+            hard_selection = torch.zeros(labels.size(0), device=device, dtype=torch.float32)
+            hard_selection[selected] = 1.0
+            sam_gap = diagnostic_sam_gap_scores(
+                model,
+                images,
+                labels,
+                hard_selection,
+                rho=args.sam_rho,
+            )
+
+            with torch.no_grad():
+                train_features_all, train_logits_all = _feature_logits(model, images)
+                train_errors_all = last_layer_error(train_logits_all, labels)
+                denom_w, denom_b = adam_last_layer_denominators(model, optimizers[m_idx])
+                val_features, val_logits = val_cache[m_idx]
+                step_size = args.diag_oracle_lr
+                if step_size <= 0:
+                    step_size = float(optimizers[m_idx].param_groups[0].get("lr", args.lr))
+
+                cand = selected_sorted
+                cand_np = cand.detach().cpu().numpy().astype(np.int64)
+                cand_features = train_features_all[cand].detach()
+                cand_errors = train_errors_all[cand].detach()
+                cand_loss = agg_loss[cand].detach()
+                cand_sam_utility = (-sam_gap[cand]).detach()
+
+                for target_name, val_labels in target_labels.items():
+                    val_errors = last_layer_error(val_logits, val_labels)
+                    raw_all, adam_all = alignment_scores(
+                        train_features_all,
+                        train_errors_all,
+                        val_features,
+                        val_errors,
+                        denom_w,
+                        denom_b,
+                    )
+                    oracle = last_layer_one_step_improvement(
+                        model,
+                        cand_features,
+                        cand_errors,
+                        val_features,
+                        val_logits,
+                        val_labels,
+                        step_size=step_size,
+                    )
+                    neg_loss = (-cand_loss).detach()
+                    align_raw = raw_all[cand].detach()
+                    align_adam = adam_all[cand].detach()
+
+                    oracle_np = oracle.detach().cpu().numpy().astype(float)
+                    neg_loss_np = neg_loss.detach().cpu().numpy().astype(float)
+                    sam_utility_np = cand_sam_utility.detach().cpu().numpy().astype(float)
+                    raw_np = align_raw.detach().cpu().numpy().astype(float)
+                    adam_np = align_adam.detach().cpu().numpy().astype(float)
+                    clean_sel = clean_flags[cand_np].astype(bool)
+
+                    store = per_target_values[target_name]
+                    store["oracle"].extend(oracle_np.tolist())
+                    store["neg_loss"].extend(neg_loss_np.tolist())
+                    store["sam_utility"].extend(sam_utility_np.tolist())
+                    store["align_raw"].extend(raw_np.tolist())
+                    store["align_adam"].extend(adam_np.tolist())
+                    store["clean"].extend(clean_sel.astype(float).tolist())
+
+                    for j, local_idx in enumerate(cand_np):
+                        records.append(
+                            {
+                                "epoch": int(epoch),
+                                "batch": int(batch_idx),
+                                "model": int(m_idx),
+                                "target": target_name,
+                                "index": int(idx_np[local_idx]),
+                                "local_index": int(local_idx),
+                                "noisy_label": int(noisy_np[local_idx]),
+                                "clean_label": int(clean_np[local_idx]),
+                                "is_clean": bool(clean_flags[local_idx]),
+                                "neg_loss": float(neg_loss_np[j]),
+                                "sam_utility": float(sam_utility_np[j]),
+                                "align_raw": float(raw_np[j]),
+                                "align_adam": float(adam_np[j]),
+                                "oracle_improvement": float(oracle_np[j]),
+                                "oracle_step_size": float(step_size),
+                            }
+                        )
+
+    summaries = {}
+    for target_name, values in per_target_values.items():
+        oracle = np.asarray(values["oracle"], dtype=np.float64)
+        neg_loss = np.asarray(values["neg_loss"], dtype=np.float64)
+        sam_utility = np.asarray(values["sam_utility"], dtype=np.float64)
+        align_raw = np.asarray(values["align_raw"], dtype=np.float64)
+        align_adam = np.asarray(values["align_adam"], dtype=np.float64)
+        clean = np.asarray(values["clean"], dtype=bool)
+        if oracle.size == 0:
+            continue
+
+        top_oracle = top_fraction_mask(oracle)
+        top_loss = top_fraction_mask(neg_loss)
+        top_sam = top_fraction_mask(sam_utility)
+        top_align_adam = top_fraction_mask(align_adam)
+        finite_oracle = np.isfinite(oracle)
+        oracle_positive_rate = float(np.mean(oracle[finite_oracle] > 0.0)) if finite_oracle.any() else float("nan")
+        summaries[target_name] = {
+            "epoch": int(epoch),
+            "target": target_name,
+            "num_records": int(oracle.size),
+            "oracle_mean": _safe_mean(oracle),
+            "oracle_std": float(np.nanstd(oracle)),
+            "oracle_positive_rate": oracle_positive_rate,
+            "oracle_clean_mean": _safe_mean(oracle[clean]),
+            "oracle_noisy_mean": _safe_mean(oracle[~clean]),
+            "auc_oracle_clean": _safe_auc(oracle, clean),
+            "auc_loss_clean": _safe_auc(neg_loss, clean),
+            "auc_sam_utility_clean": _safe_auc(sam_utility, clean),
+            "auc_align_adam_clean": _safe_auc(align_adam, clean),
+            "pearson_loss_oracle": pearson_corr(neg_loss, oracle),
+            "spearman_loss_oracle": spearman_corr(neg_loss, oracle),
+            "pearson_sam_utility_oracle": pearson_corr(sam_utility, oracle),
+            "spearman_sam_utility_oracle": spearman_corr(sam_utility, oracle),
+            "pearson_align_raw_oracle": pearson_corr(align_raw, oracle),
+            "spearman_align_raw_oracle": spearman_corr(align_raw, oracle),
+            "pearson_align_adam_oracle": pearson_corr(align_adam, oracle),
+            "spearman_align_adam_oracle": spearman_corr(align_adam, oracle),
+            "top25_oracle_mean_by_oracle": _safe_mean(oracle[top_oracle]),
+            "top25_oracle_mean_by_loss": _safe_mean(oracle[top_loss]),
+            "top25_oracle_mean_by_sam_utility": _safe_mean(oracle[top_sam]),
+            "top25_oracle_mean_by_align_adam": _safe_mean(oracle[top_align_adam]),
+            "top25_clean_rate_by_oracle": _clean_rate(top_oracle, clean),
+            "top25_clean_rate_by_loss": _clean_rate(top_loss, clean),
+            "top25_clean_rate_by_sam_utility": _clean_rate(top_sam, clean),
+            "top25_clean_rate_by_align_adam": _clean_rate(top_align_adam, clean),
+        }
+
+    summary_path = os.path.join(args.diag_oracle_output_dir, "oracle_summary.jsonl")
+    samples_path = os.path.join(args.diag_oracle_output_dir, f"oracle_epoch_{epoch:04d}.jsonl")
+    with open(summary_path, "a") as f:
+        for target_name in sorted(summaries):
+            f.write(json.dumps(summaries[target_name]) + "\n")
+    with open(samples_path, "w") as f:
+        for record in records:
+            f.write(json.dumps(record) + "\n")
+
+    for model in models:
+        model.zero_grad()
+    for model, training in zip(models, was_training):
+        model.train(training)
+    return {"oracle": summaries, "sample_file": samples_path, "summary_file": summary_path}
 
 
 def load_datasets(args) -> Tuple:
@@ -1363,7 +1805,7 @@ def main():
         **loader_kwargs,
     )
     diag_train_loader = None
-    if args.diag_alignment:
+    if args.diag_alignment or args.diag_oracle:
         diag_loader_kwargs = dict(loader_kwargs)
         if args.num_workers > 0:
             diag_loader_kwargs["persistent_workers"] = False
@@ -1547,6 +1989,26 @@ def main():
             )
             if diag_log:
                 print(f"Diagnostics saved: {diag_log.get('summary_file', '')}")
+        if (
+            args.diag_oracle
+            and val_loader is not None
+            and args.diag_oracle_every_epoch > 0
+            and epoch % args.diag_oracle_every_epoch == 0
+        ):
+            oracle_log = run_utility_oracle_diagnostics(
+                epoch,
+                args,
+                models,
+                optimizers,
+                diag_train_loader,
+                val_loader,
+                base_train_dataset,
+                remember_rate,
+                active_mask,
+            )
+            if oracle_log:
+                diag_log.update({"utility_oracle": oracle_log})
+                print(f"Oracle diagnostics saved: {oracle_log.get('summary_file', '')}")
         print(
                         f"Epoch [{epoch}/{args.n_epoch}] "
             + " ".join([f"TrainAcc_M{i}:{train_metrics[f'train_acc_{i}']:.2f}%" for i in range(args.num_models)])
