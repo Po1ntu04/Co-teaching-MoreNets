@@ -721,6 +721,14 @@ def _safe_mean(values: np.ndarray) -> float:
     return float(np.mean(values))
 
 
+def _safe_finite_mean(values: np.ndarray) -> float:
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return float("nan")
+    return float(np.mean(values))
+
+
 def _clean_rate(mask: np.ndarray, clean_flags: np.ndarray) -> float:
     mask = np.asarray(mask, dtype=bool)
     if mask.sum() == 0:
@@ -1746,9 +1754,9 @@ def run_target_construction_diagnostics(
             "source": source,
             "source_available": True,
             "num_records": int(oracle.size),
-            "source_size": float(np.nanmean(np.asarray(values["source_size"], dtype=np.float64))),
-            "source_clean_rate": float(np.nanmean(np.asarray(values["source_clean_rate"], dtype=np.float64))),
-            "source_positive_rate": float(np.nanmean(np.asarray(values["source_positive_rate"], dtype=np.float64))),
+            "source_size": _safe_finite_mean(values["source_size"]),
+            "source_clean_rate": _safe_finite_mean(values["source_clean_rate"]),
+            "source_positive_rate": _safe_finite_mean(values["source_positive_rate"]),
             "oracle_mean": oracle_mean,
             "oracle_std": float(np.nanstd(oracle)),
             "oracle_positive_rate": float(np.mean(oracle[finite_oracle] > 0.0)) if finite_oracle.any() else float("nan"),

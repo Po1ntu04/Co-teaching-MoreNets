@@ -207,26 +207,36 @@ function Get-Stage3BatchSize {
     return 512
 }
 
+function Get-Stage3RunName {
+    param(
+        [string]$Mode,
+        [int]$Seed
+    )
+    if ($Mode -eq "e31") {
+        return "e31_seed$Seed"
+    }
+    return "smoke_seed$Seed"
+}
+
 function Get-Stage3Command {
     param(
         [string]$Mode,
         [int]$Seed,
         [int]$Gpu,
-        [int]$BatchSize
+        [int]$BatchSize,
+        [string]$RunName
     )
     $epochs = 4
     $iters = 20
     $diagEvery = 1
     $diagBatches = 1
     $diagCandidates = 64
-    $runName = "smoke_seed$Seed"
     if ($Mode -eq "e31") {
         $epochs = 31
         $iters = 100
         $diagEvery = 5
         $diagBatches = 2
         $diagCandidates = 128
-        $runName = "e31_seed$Seed"
     }
 
     return @(
@@ -242,8 +252,8 @@ function Get-Stage3Command {
         "--diag_target_construction --diag_target_every_epoch $diagEvery",
         "--diag_target_batches $diagBatches --diag_target_val_batches 1 --diag_target_candidates $diagCandidates",
         "--diag_target_sources clean_val,noisy_val,peer_consensus,ema_teacher,purified_buffer",
-        "--result_dir results_stage3/target_construction_$runName",
-        "--diag_target_output_dir results_diag/stage3_target_construction/$runName"
+        "--result_dir results_stage3/target_construction_$RunName",
+        "--diag_target_output_dir results_diag/stage3_target_construction/$RunName"
     ) -join " "
 }
 
@@ -268,7 +278,9 @@ $gpuParts = $gpuInfo.Split(",", 2)
 $gpuIndex = [int]$gpuParts[0]
 $gpuName = $gpuParts[1]
 $batchSize = Get-Stage3BatchSize -GpuName $gpuName
-$runCmd = Get-Stage3Command -Mode $Mode -Seed $Seed -Gpu $gpuIndex -BatchSize $batchSize
+$runName = Get-Stage3RunName -Mode $Mode -Seed $Seed
+$diagDir = "results_diag/stage3_target_construction/$runName"
+$runCmd = Get-Stage3Command -Mode $Mode -Seed $Seed -Gpu $gpuIndex -BatchSize $batchSize -RunName $runName
 $logFile = "logs/stage3/$Session.log"
 
 $remoteScript = @'
@@ -281,6 +293,7 @@ CONDA_ENV="$(decode_arg "$5")"
 SESSION="$(decode_arg "$6")"
 LOG_FILE="$(decode_arg "$7")"
 RUN_CMD="$(decode_arg "$8")"
+DIAG_DIR="$(decode_arg "$9")"
 
 cd "$REPO_DIR"
 git fetch "$GIT_REMOTE"
@@ -303,7 +316,7 @@ RUNNER="$REPO_DIR/.workflow_${SESSION}.sh"
     echo "echo \"== command ==\""
     printf 'echo %q\n' "$RUN_CMD"
     echo "$RUN_CMD"
-    echo "python scripts/analyze_stage3_target_construction.py \"results_diag/stage3_target_construction\" --output \"results_diag/stage3_target_construction/stage3_${SESSION}_summary.json\""
+    echo "python scripts/analyze_stage3_target_construction.py \"$DIAG_DIR\" --output \"$DIAG_DIR/stage3_${SESSION}_summary.json\""
 } > "$RUNNER"
 chmod +x "$RUNNER"
 tmux new-session -d -s "$SESSION" "bash '$RUNNER' > '$LOG_FILE' 2>&1"
@@ -319,7 +332,8 @@ Invoke-Stage3RemoteScript -Config $config -Target $target -Script $remoteScript 
     $config.DefaultCondaEnv,
     $Session,
     $logFile,
-    $runCmd
+    $runCmd,
+    $diagDir
 )
 
 Write-Host "Started Stage-3 $Mode seed $Seed on GPU $gpuIndex ($gpuName), batch_size=$batchSize."
