@@ -253,7 +253,7 @@ function Get-Stage3Command {
     $diagArgs = @(
         "--diag_target_construction --diag_target_every_epoch $diagEvery",
         "--diag_target_batches $diagBatches --diag_target_val_batches 1 --diag_target_candidates $diagCandidates",
-        "--diag_target_sources clean_val,noisy_val,peer_consensus,ema_teacher,purified_buffer"
+        "--diag_target_sources clean_val,noisy_val,peer_consensus,ema_teacher,purified_buffer,purified_buffer_balanced,purified_buffer_moderate,purified_buffer_coverage,ema_purified"
     ) -join " "
     $utilityArgs = "--utility_mode none"
 
