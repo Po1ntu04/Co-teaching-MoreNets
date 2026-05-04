@@ -294,19 +294,17 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
 fi
 
 RUNNER="$REPO_DIR/.workflow_${SESSION}.sh"
-cat > "$RUNNER" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-cd "$REPO_DIR"
-$CONDA_INIT
-conda activate "$CONDA_ENV"
-echo "== command =="
-echo "$RUN_CMD"
-$RUN_CMD
-python scripts/analyze_stage3_target_construction.py \
-  "results_diag/stage3_target_construction" \
-  --output "results_diag/stage3_target_construction/stage3_${SESSION}_summary.json"
-EOF
+{
+    echo "#!/usr/bin/env bash"
+    echo "set -euo pipefail"
+    echo "cd \"$REPO_DIR\""
+    echo "$CONDA_INIT"
+    echo "conda activate \"$CONDA_ENV\""
+    echo "echo \"== command ==\""
+    printf 'echo %q\n' "$RUN_CMD"
+    echo "$RUN_CMD"
+    echo "python scripts/analyze_stage3_target_construction.py \"results_diag/stage3_target_construction\" --output \"results_diag/stage3_target_construction/stage3_${SESSION}_summary.json\""
+} > "$RUNNER"
 chmod +x "$RUNNER"
 tmux new-session -d -s "$SESSION" "bash '$RUNNER' > '$LOG_FILE' 2>&1"
 echo "Started tmux session: $SESSION"
