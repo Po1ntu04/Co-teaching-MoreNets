@@ -11,6 +11,10 @@ KEYS = [
     "source_size",
     "source_clean_rate",
     "source_positive_rate",
+    "source_effective_size",
+    "source_loss_mean",
+    "source_loss_std",
+    "source_confidence_mean",
     "oracle_mean",
     "oracle_positive_rate",
     "candidate_clean_rate",
@@ -51,6 +55,18 @@ def finite_mean(values: List[float]) -> float:
     if not finite:
         return float("nan")
     return sum(finite) / len(finite)
+
+
+def mean_label_hist(rows: List[Dict]) -> List[float]:
+    hists = [r.get("source_label_hist") for r in rows if r.get("source_label_hist")]
+    if not hists:
+        return []
+    width = max(len(hist) for hist in hists)
+    totals = [0.0 for _ in range(width)]
+    for hist in hists:
+        for idx, value in enumerate(hist):
+            totals[idx] += float(value)
+    return [value / float(len(hists)) for value in totals]
 
 
 def count_pass_epochs(rows: List[Dict]) -> Dict[str, int]:
@@ -109,6 +125,7 @@ def summarize(records: List[Dict]) -> Dict:
         }
         for key in KEYS:
             summary[key] = finite_mean([r.get(key) for r in available_rows])
+        summary["source_label_hist"] = mean_label_hist(available_rows)
         summary.update(count_pass_epochs(available_rows))
         summary["decision_hint"] = decision_hint(source, summary)
         output["sources"][source] = summary

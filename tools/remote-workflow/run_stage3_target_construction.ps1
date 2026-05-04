@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("smoke", "e31", "baseline", "target_s025", "target_s05")]
+    [ValidateSet("smoke", "e31", "baseline", "target_s025", "target_s05", "target_s010", "target_rerank", "diag_variants")]
     [string]$Mode = "smoke",
     [int]$Seed = 1,
     [string]$Branch = "",
@@ -38,7 +38,7 @@ function Invoke-LocalStage3Check {
     if ($LASTEXITCODE -ne 0) {
         throw "main.py --help failed."
     }
-    foreach ($flag in @("--diag_target_construction", "--diag_target_sources", "--diag_target_output_dir")) {
+    foreach ($flag in @("--diag_target_construction", "--diag_target_sources", "--diag_target_output_dir", "--target_align_mode")) {
         if (-not ($helpText -match [regex]::Escape($flag))) {
             throw "Missing CLI flag in --help: $flag"
         }
@@ -53,6 +53,7 @@ function Invoke-Stage3SelectiveGitSync {
     $files = @(
         "main.py",
         "experiments/STAGE3_TARGET_CONSTRUCTION_DIAGNOSTIC_CN.md",
+        "experiments/STAGE3_5_CONSERVATIVE_TARGET_ALIGN_CN.md",
         "scripts/analyze_stage3_target_construction.py",
         "tools/remote-workflow/lib.ps1",
         "tools/remote-workflow/run_stage3_target_construction.ps1"
@@ -224,6 +225,15 @@ function Get-Stage3RunName {
     if ($Mode -eq "target_s05") {
         return "algo_target_s05_seed$Seed"
     }
+    if ($Mode -eq "target_s010") {
+        return "stage35_target_s010_seed$Seed"
+    }
+    if ($Mode -eq "target_rerank") {
+        return "stage35_target_rerank_seed$Seed"
+    }
+    if ($Mode -eq "diag_variants") {
+        return "stage35_diag_variants_seed$Seed"
+    }
     return "smoke_seed$Seed"
 }
 
@@ -259,15 +269,33 @@ function Get-Stage3Command {
             "--diag_target_sources clean_val,noisy_val,peer_consensus,ema_teacher,purified_buffer"
         ) -join " "
     }
-    elseif ($Mode -in @("baseline", "target_s025", "target_s05")) {
+    elseif ($Mode -eq "diag_variants") {
+        $epochs = 31
+        $iters = 100
+        $diagEvery = 5
+        $diagBatches = 2
+        $diagCandidates = 128
+        $diagArgs = @(
+            "--diag_target_construction --diag_target_every_epoch $diagEvery",
+            "--diag_target_batches $diagBatches --diag_target_val_batches 1 --diag_target_candidates $diagCandidates",
+            "--diag_target_sources clean_val,noisy_val,peer_consensus,ema_teacher,purified_buffer,purified_buffer_balanced,purified_buffer_moderate,purified_buffer_coverage,ema_purified"
+        ) -join " "
+    }
+    elseif ($Mode -in @("baseline", "target_s025", "target_s05", "target_s010", "target_rerank")) {
         $epochs = 31
         $iters = 100
         $diagArgs = ""
         if ($Mode -eq "target_s025") {
-            $utilityArgs = "--utility_mode target_align --utility_strength 0.25 --target_align_source purified_buffer --target_align_min_source 16 --target_align_max_source 128"
+            $utilityArgs = "--utility_mode target_align --target_align_mode weighted --utility_strength 0.25 --target_align_source purified_buffer --target_align_min_source 16 --target_align_max_source 128"
         }
         elseif ($Mode -eq "target_s05") {
-            $utilityArgs = "--utility_mode target_align --utility_strength 0.5 --target_align_source purified_buffer --target_align_min_source 16 --target_align_max_source 128"
+            $utilityArgs = "--utility_mode target_align --target_align_mode weighted --utility_strength 0.5 --target_align_source purified_buffer --target_align_min_source 16 --target_align_max_source 128"
+        }
+        elseif ($Mode -eq "target_s010") {
+            $utilityArgs = "--utility_mode target_align --target_align_mode weighted --utility_strength 0.10 --target_align_source purified_buffer --target_align_min_source 16 --target_align_max_source 128"
+        }
+        elseif ($Mode -eq "target_rerank") {
+            $utilityArgs = "--utility_mode target_align --target_align_mode rerank_only --target_align_rerank_frac 0.75 --utility_strength 1.0 --target_align_source purified_buffer --target_align_min_source 16 --target_align_max_source 128"
         }
     }
 

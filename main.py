@@ -151,15 +151,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--utility_min", type=float, default=0.2, help="minimum utility multiplier")
     parser.add_argument("--utility_max", type=float, default=2.0, help="maximum utility multiplier")
     parser.add_argument(
+        "--target_align_mode",
+        type=str,
+        default="weighted",
+        choices=["weighted", "rerank_only"],
+        help="how target_align uses utility scores inside the reliable set",
+    )
+    parser.add_argument(
         "--target_align_source",
         type=str,
         default="purified_buffer",
-        choices=["purified_buffer", "ema_teacher"],
+        choices=[
+            "purified_buffer",
+            "purified_buffer_balanced",
+            "purified_buffer_moderate",
+            "purified_buffer_coverage",
+            "ema_purified",
+            "ema_teacher",
+        ],
         help="target source for utility_mode=target_align",
     )
     parser.add_argument("--target_align_top_frac", type=float, default=0.25, help="top teacher-confidence source fraction")
     parser.add_argument("--target_align_min_source", type=int, default=16, help="minimum target source size")
     parser.add_argument("--target_align_max_source", type=int, default=128, help="maximum purified-buffer source size")
+    parser.add_argument(
+        "--target_align_rerank_frac",
+        type=float,
+        default=0.75,
+        help="fraction of reliable samples kept by target_align rerank_only mode",
+    )
     # ------------------------------------------------------------------------
     # Replay buffer (stream-like stability)
     parser.add_argument("--replay_size", type=int, default=2000, help="max replay buffer size")
@@ -308,7 +328,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--diag_target_sources",
         type=str,
         default="clean_val,noisy_val,peer_consensus,ema_teacher,purified_buffer",
-        help="comma-separated target sources: clean_val,noisy_val,peer_consensus,ema_teacher,purified_buffer",
+        help=(
+            "comma-separated target sources: clean_val,noisy_val,peer_consensus,"
+            "ema_teacher,purified_buffer,purified_buffer_balanced,"
+            "purified_buffer_moderate,purified_buffer_coverage,ema_purified"
+        ),
     )
     parser.add_argument(
         "--diag_target_top_frac",
@@ -638,6 +662,23 @@ def utility_scores_to_weights(
 
     valid_scores = selected_scores[finite]
     score_mean = float(valid_scores.mean().item())
+
+    if getattr(args, "target_align_mode", "weighted") == "rerank_only":
+        selected_utility = torch.zeros_like(selected_scores)
+        keep_frac = min(max(float(args.target_align_rerank_frac), 1e-6), 1.0)
+        keep_count = max(1, int(math.ceil(float(selected_scores.numel()) * keep_frac)))
+        keep_count = min(keep_count, int(finite.sum().item()))
+        finite_indices = torch.where(finite)[0]
+        keep_local = finite_indices[torch.argsort(selected_scores[finite_indices], descending=True)[:keep_count]]
+        selected_utility[keep_local] = 1.0
+        utility[selected_mask] = selected_utility
+        return (
+            utility,
+            float(selected_utility.mean().item()),
+            float(selected_utility.std(unbiased=False).item()),
+            score_mean,
+        )
+
     centered = selected_scores - valid_scores.mean()
     scale = valid_scores.std(unbiased=False).clamp(min=1e-6) * max(args.utility_temp, 1e-6)
     utility_selected = torch.sigmoid(centered / scale) * 2.0
@@ -1494,7 +1535,17 @@ def run_utility_oracle_diagnostics(
 
 
 def parse_target_sources(raw_sources: str) -> List[str]:
-    allowed = {"clean_val", "noisy_val", "peer_consensus", "ema_teacher", "purified_buffer"}
+    allowed = {
+        "clean_val",
+        "noisy_val",
+        "peer_consensus",
+        "ema_teacher",
+        "purified_buffer",
+        "purified_buffer_balanced",
+        "purified_buffer_moderate",
+        "purified_buffer_coverage",
+        "ema_purified",
+    }
     sources = []
     for item in str(raw_sources).split(","):
         source = item.strip()
@@ -1520,11 +1571,60 @@ def _top_fraction_indices(scores: torch.Tensor, fraction: float, min_count: int 
     return valid_indices[order[:k]]
 
 
-def _source_meta(size: int = 0, clean_rate: float = float("nan"), positive_rate: float = float("nan")) -> Dict[str, float]:
+def _label_histogram(labels: Sequence[int]) -> List[int]:
+    labels_np = np.asarray(labels, dtype=np.int64).reshape(-1)
+    if labels_np.size == 0:
+        return []
+    max_label = int(labels_np.max())
+    if max_label < 0:
+        return []
+    hist = np.bincount(labels_np, minlength=max_label + 1)
+    return [int(x) for x in hist.tolist()]
+
+
+def _effective_label_size(label_hist: Sequence[int]) -> float:
+    hist = np.asarray(label_hist, dtype=np.float64)
+    total = float(hist.sum())
+    if total <= 0.0:
+        return float("nan")
+    probs = hist / total
+    denom = float(np.sum(probs ** 2))
+    if denom <= 0.0:
+        return float("nan")
+    return 1.0 / denom
+
+
+def _mean_label_hist(label_hists: Sequence[Sequence[int]]) -> List[float]:
+    valid = [list(hist) for hist in label_hists if hist]
+    if not valid:
+        return []
+    width = max(len(hist) for hist in valid)
+    arr = np.zeros((len(valid), width), dtype=np.float64)
+    for row, hist in enumerate(valid):
+        arr[row, : len(hist)] = np.asarray(hist, dtype=np.float64)
+    return [float(x) for x in arr.mean(axis=0).tolist()]
+
+
+def _source_meta(
+    size: int = 0,
+    clean_rate: float = float("nan"),
+    positive_rate: float = float("nan"),
+    label_hist: Sequence[int] = None,
+    loss_mean: float = float("nan"),
+    loss_std: float = float("nan"),
+    confidence_mean: float = float("nan"),
+) -> Dict:
+    if label_hist is None:
+        label_hist = []
     return {
         "source_size": int(size),
         "source_clean_rate": float(clean_rate),
         "source_positive_rate": float(positive_rate),
+        "source_label_hist": [int(x) for x in label_hist],
+        "source_effective_size": float(_effective_label_size(label_hist)),
+        "source_loss_mean": float(loss_mean),
+        "source_loss_std": float(loss_std),
+        "source_confidence_mean": float(confidence_mean),
     }
 
 
@@ -1532,6 +1632,48 @@ def _safe_ratio(numer: float, denom: float) -> float:
     if not math.isfinite(float(numer)) or not math.isfinite(float(denom)) or abs(float(denom)) <= 1e-12:
         return float("nan")
     return float(numer) / float(denom)
+
+
+def _select_balanced_indices(indices: np.ndarray, labels: np.ndarray, max_samples: int) -> np.ndarray:
+    if indices.size == 0 or max_samples <= 0 or indices.size <= max_samples:
+        return indices
+    groups: Dict[int, List[int]] = {}
+    for idx, label in zip(indices.tolist(), labels.tolist()):
+        groups.setdefault(int(label), []).append(int(idx))
+    selected: List[int] = []
+    class_order = sorted(groups, key=lambda key: (len(groups[key]), key))
+    cursor = 0
+    while len(selected) < max_samples and class_order:
+        label = class_order[cursor % len(class_order)]
+        if groups[label]:
+            selected.append(groups[label].pop(0))
+        class_order = [key for key in class_order if groups[key]]
+        cursor += 1
+    return np.asarray(selected, dtype=np.int64)
+
+
+def _select_coverage_indices(
+    indices: np.ndarray,
+    labels: np.ndarray,
+    purified_replay: PurifiedReplayBuffer,
+    max_samples: int,
+) -> np.ndarray:
+    if indices.size == 0 or max_samples <= 0 or indices.size <= max_samples:
+        return indices
+    full_counts: Dict[int, int] = {}
+    for info in purified_replay.memory.values():
+        full_counts[int(info.label)] = full_counts.get(int(info.label), 0) + 1
+    max_count = max(full_counts.values()) if full_counts else 1
+    scored = []
+    for idx, label in zip(indices.tolist(), labels.tolist()):
+        info = purified_replay.memory.get(int(idx))
+        q = float(info.q) if info is not None else 0.0
+        u = float(info.u) if info is not None else 0.0
+        label = int(label)
+        coverage_need = 1.0 - float(full_counts.get(label, 0)) / float(max_count)
+        scored.append((coverage_need, u, q, -full_counts.get(label, 0), int(idx)))
+    scored.sort(reverse=True)
+    return np.asarray([item[-1] for item in scored[:max_samples]], dtype=np.int64)
 
 
 def build_purified_buffer_source(
@@ -1542,6 +1684,9 @@ def build_purified_buffer_source(
     max_samples: int,
     min_clean_p: float,
     min_stability: int,
+    variant: str = "purified_buffer",
+    teacher_model: torch.nn.Module = None,
+    include_clean_meta: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
     if purified_replay is None or len(purified_replay) == 0:
         return None, None, _source_meta()
@@ -1551,7 +1696,27 @@ def build_purified_buffer_source(
         indices = np.asarray(purified_replay.indices, dtype=np.int64)
     if indices.size == 0:
         return None, None, _source_meta()
-    if max_samples > 0 and indices.size > max_samples:
+
+    labels_for_selection = np.asarray(
+        [purified_replay.memory[int(idx)].label for idx in indices if int(idx) in purified_replay.memory],
+        dtype=np.int64,
+    )
+    if labels_for_selection.size != indices.size:
+        labels_for_selection = []
+        for idx in indices:
+            _, noisy_label, _ = base_train_dataset[int(idx)]
+            labels_for_selection.append(int(noisy_label))
+        labels_for_selection = np.asarray(labels_for_selection, dtype=np.int64)
+
+    if variant == "purified_buffer_balanced":
+        indices = _select_balanced_indices(indices, labels_for_selection, max_samples)
+    elif variant == "purified_buffer_coverage":
+        indices = _select_coverage_indices(indices, labels_for_selection, purified_replay, max_samples)
+    elif variant == "purified_buffer_moderate":
+        candidate_limit = max(max_samples, max_samples * 4)
+        if candidate_limit > 0 and indices.size > candidate_limit:
+            indices = _select_coverage_indices(indices, labels_for_selection, purified_replay, candidate_limit)
+    elif max_samples > 0 and indices.size > max_samples:
         indices = indices[:max_samples]
 
     samples = [base_train_dataset[int(idx)] for idx in indices]
@@ -1560,13 +1725,59 @@ def build_purified_buffer_source(
     noisy_labels = torch.tensor(noisy_labels, device=device, dtype=torch.long)
     returned_indices_np = np.asarray(returned_indices, dtype=np.int64)
     noisy_np = noisy_labels.detach().cpu().numpy().astype(np.int64)
-    clean_flags = get_clean_mask(base_train_dataset, returned_indices_np, noisy_np)
+    clean_flags = None
+    if include_clean_meta:
+        clean_flags = get_clean_mask(base_train_dataset, returned_indices_np, noisy_np)
+    teacher_was_training = None
+    if teacher_model is not None:
+        teacher_was_training = teacher_model.training
+        teacher_model.eval()
     with torch.no_grad():
         features, logits = _feature_logits(model, images)
-        errors = last_layer_error(logits, noisy_labels)
+        losses = F.cross_entropy(logits, noisy_labels, reduction="none")
+        probs = logits.softmax(dim=1)
+        confidence = probs.max(dim=1).values
+        if variant == "ema_purified" and teacher_model is not None:
+            teacher_probs = teacher_model(images).softmax(dim=1)
+            errors = last_layer_error_from_probs(logits, teacher_probs)
+            confidence = teacher_probs.max(dim=1).values
+        else:
+            errors = last_layer_error(logits, noisy_labels)
+
+        if variant == "purified_buffer_moderate" and losses.numel() > max_samples and max_samples > 0:
+            loss_np = losses.detach().cpu().numpy().astype(np.float64)
+            lower = float(np.percentile(loss_np, 40.0))
+            upper = float(np.percentile(loss_np, 90.0))
+            keep_np = np.where((loss_np >= lower) & (loss_np <= upper))[0]
+            if keep_np.size < max(1, min(max_samples, losses.numel())):
+                target = float(np.percentile(loss_np, 65.0))
+                keep_np = np.argsort(np.abs(loss_np - target))
+            keep_np = keep_np[:max_samples]
+            keep = torch.tensor(keep_np, device=device, dtype=torch.long)
+            features = features[keep]
+            logits = logits[keep]
+            errors = errors[keep]
+            losses = losses[keep]
+            confidence = confidence[keep]
+            noisy_labels = noisy_labels[keep]
+            returned_indices_np = returned_indices_np[keep_np]
+            noisy_np = noisy_np[keep_np]
+            if clean_flags is not None:
+                clean_flags = clean_flags[keep_np]
+    if teacher_model is not None and teacher_was_training is not None:
+        teacher_model.train(teacher_was_training)
+
+    label_hist = _label_histogram(noisy_np)
+    loss_np = losses.detach().cpu().numpy().astype(np.float64)
+    confidence_np = confidence.detach().cpu().numpy().astype(np.float64)
+    clean_rate = float(clean_flags.mean()) if clean_flags is not None and clean_flags.size else float("nan")
     return features.detach(), errors.detach(), _source_meta(
-        size=int(len(indices)),
-        clean_rate=float(clean_flags.mean()) if clean_flags.size else float("nan"),
+        size=int(noisy_np.size),
+        clean_rate=clean_rate,
+        label_hist=label_hist,
+        loss_mean=_safe_mean(loss_np),
+        loss_std=float(np.nanstd(loss_np)) if loss_np.size else float("nan"),
+        confidence_mean=_safe_mean(confidence_np),
     )
 
 
@@ -1664,21 +1875,46 @@ def run_target_construction_diagnostics(
         for m_idx, model in enumerate(models):
             val_features, val_logits = _feature_logits(model, val_images)
             clean_oracle_cache[m_idx] = (val_features.detach(), val_logits.detach(), val_clean_labels.detach())
+            val_probs = val_logits.softmax(dim=1)
+            val_confidence = val_probs.max(dim=1).values
 
             if "clean_val" in target_sources:
+                clean_source_losses = F.cross_entropy(val_logits, val_clean_labels, reduction="none")
+                clean_source_loss_np = clean_source_losses.detach().cpu().numpy().astype(np.float64)
+                clean_source_conf_np = val_confidence.detach().cpu().numpy().astype(np.float64)
                 source_cache[(m_idx, "clean_val")] = (
                     val_features.detach(),
                     last_layer_error(val_logits, val_clean_labels).detach(),
-                    _source_meta(size=val_images.size(0), clean_rate=float(val_clean_flags_np.mean())),
+                    _source_meta(
+                        size=val_images.size(0),
+                        clean_rate=float(val_clean_flags_np.mean()),
+                        label_hist=_label_histogram(val_clean_labels.detach().cpu().numpy().astype(np.int64)),
+                        loss_mean=_safe_mean(clean_source_loss_np),
+                        loss_std=float(np.nanstd(clean_source_loss_np)),
+                        confidence_mean=_safe_mean(clean_source_conf_np),
+                    ),
                 )
             if "noisy_val" in target_sources:
+                noisy_source_losses = F.cross_entropy(val_logits, val_noisy_labels, reduction="none")
+                noisy_source_loss_np = noisy_source_losses.detach().cpu().numpy().astype(np.float64)
+                noisy_source_conf_np = val_confidence.detach().cpu().numpy().astype(np.float64)
                 source_cache[(m_idx, "noisy_val")] = (
                     val_features.detach(),
                     last_layer_error(val_logits, val_noisy_labels).detach(),
-                    _source_meta(size=val_images.size(0), clean_rate=float(val_clean_flags_np.mean())),
+                    _source_meta(
+                        size=val_images.size(0),
+                        clean_rate=float(val_clean_flags_np.mean()),
+                        label_hist=_label_histogram(val_noisy_np),
+                        loss_mean=_safe_mean(noisy_source_loss_np),
+                        loss_std=float(np.nanstd(noisy_source_loss_np)),
+                        confidence_mean=_safe_mean(noisy_source_conf_np),
+                    ),
                 )
             if "peer_consensus" in target_sources and peer_idx.numel() >= args.diag_target_min_source:
                 peer_np = peer_idx.detach().cpu().numpy().astype(np.int64)
+                peer_losses = F.cross_entropy(val_logits[peer_idx], val_consensus_pred[peer_idx], reduction="none")
+                peer_loss_np = peer_losses.detach().cpu().numpy().astype(np.float64)
+                peer_conf_np = val_consensus_conf[peer_idx].detach().cpu().numpy().astype(np.float64)
                 source_cache[(m_idx, "peer_consensus")] = (
                     val_features[peer_idx].detach(),
                     last_layer_error(val_logits[peer_idx], val_consensus_pred[peer_idx]).detach(),
@@ -1686,20 +1922,45 @@ def run_target_construction_diagnostics(
                         size=int(peer_idx.numel()),
                         clean_rate=float(val_clean_flags_np[peer_np].mean()),
                         positive_rate=float(peer_base_mask[peer_idx].float().mean().item()),
+                        label_hist=_label_histogram(val_consensus_pred[peer_idx].detach().cpu().numpy().astype(np.int64)),
+                        loss_mean=_safe_mean(peer_loss_np),
+                        loss_std=float(np.nanstd(peer_loss_np)),
+                        confidence_mean=_safe_mean(peer_conf_np),
                     ),
                 )
             if "ema_teacher" in target_sources and teacher_idx.numel() >= args.diag_target_min_source:
                 teacher_np = teacher_idx.detach().cpu().numpy().astype(np.int64)
+                teacher_source_probs = val_teacher_committee_probs[teacher_idx]
+                teacher_losses = -(teacher_source_probs * F.log_softmax(val_logits[teacher_idx], dim=1)).sum(dim=1)
+                teacher_loss_np = teacher_losses.detach().cpu().numpy().astype(np.float64)
+                teacher_conf_np = val_teacher_conf[teacher_idx].detach().cpu().numpy().astype(np.float64)
+                teacher_labels_np = teacher_source_probs.argmax(dim=1).detach().cpu().numpy().astype(np.int64)
                 source_cache[(m_idx, "ema_teacher")] = (
                     val_features[teacher_idx].detach(),
-                    last_layer_error_from_probs(val_logits[teacher_idx], val_teacher_committee_probs[teacher_idx]).detach(),
+                    last_layer_error_from_probs(val_logits[teacher_idx], teacher_source_probs).detach(),
                     _source_meta(
                         size=int(teacher_idx.numel()),
                         clean_rate=float(val_clean_flags_np[teacher_np].mean()),
                         positive_rate=float(val_teacher_conf[teacher_idx].mean().item()),
+                        label_hist=_label_histogram(teacher_labels_np),
+                        loss_mean=_safe_mean(teacher_loss_np),
+                        loss_std=float(np.nanstd(teacher_loss_np)),
+                        confidence_mean=_safe_mean(teacher_conf_np),
                     ),
                 )
-            if "purified_buffer" in target_sources:
+            purified_sources = [
+                source
+                for source in target_sources
+                if source
+                in {
+                    "purified_buffer",
+                    "purified_buffer_balanced",
+                    "purified_buffer_moderate",
+                    "purified_buffer_coverage",
+                    "ema_purified",
+                }
+            ]
+            for source in purified_sources:
                 source_features, source_errors, meta = build_purified_buffer_source(
                     model,
                     base_train_dataset,
@@ -1708,9 +1969,12 @@ def run_target_construction_diagnostics(
                     max_samples=max(args.diag_target_min_source, args.diag_target_candidates * 4),
                     min_clean_p=args.replay_admission,
                     min_stability=max(1, args.replay_stability),
+                    variant=source,
+                    teacher_model=teacher_models[m_idx],
+                    include_clean_meta=True,
                 )
                 if source_features is not None and source_features.size(0) >= args.diag_target_min_source:
-                    source_cache[(m_idx, "purified_buffer")] = (source_features, source_errors, meta)
+                    source_cache[(m_idx, source)] = (source_features, source_errors, meta)
 
     per_source_values: Dict[str, Dict[str, List[float]]] = {
         source: {
@@ -1722,6 +1986,11 @@ def run_target_construction_diagnostics(
             "source_size": [],
             "source_clean_rate": [],
             "source_positive_rate": [],
+            "source_effective_size": [],
+            "source_loss_mean": [],
+            "source_loss_std": [],
+            "source_confidence_mean": [],
+            "source_label_hist": [],
         }
         for source in target_sources
     }
@@ -1811,6 +2080,11 @@ def run_target_construction_diagnostics(
                     store["source_size"].append(float(meta["source_size"]))
                     store["source_clean_rate"].append(float(meta["source_clean_rate"]))
                     store["source_positive_rate"].append(float(meta["source_positive_rate"]))
+                    store["source_effective_size"].append(float(meta.get("source_effective_size", float("nan"))))
+                    store["source_loss_mean"].append(float(meta.get("source_loss_mean", float("nan"))))
+                    store["source_loss_std"].append(float(meta.get("source_loss_std", float("nan"))))
+                    store["source_confidence_mean"].append(float(meta.get("source_confidence_mean", float("nan"))))
+                    store["source_label_hist"].append(meta.get("source_label_hist", []))
 
                     for j, local_idx in enumerate(cand_np):
                         records.append(
@@ -1832,6 +2106,11 @@ def run_target_construction_diagnostics(
                                 "source_size": int(meta["source_size"]),
                                 "source_clean_rate": float(meta["source_clean_rate"]),
                                 "source_positive_rate": float(meta["source_positive_rate"]),
+                                "source_label_hist": meta.get("source_label_hist", []),
+                                "source_effective_size": float(meta.get("source_effective_size", float("nan"))),
+                                "source_loss_mean": float(meta.get("source_loss_mean", float("nan"))),
+                                "source_loss_std": float(meta.get("source_loss_std", float("nan"))),
+                                "source_confidence_mean": float(meta.get("source_confidence_mean", float("nan"))),
                             }
                         )
 
@@ -1851,6 +2130,11 @@ def run_target_construction_diagnostics(
                 "source_size": 0,
                 "source_clean_rate": float("nan"),
                 "source_positive_rate": float("nan"),
+                "source_label_hist": [],
+                "source_effective_size": float("nan"),
+                "source_loss_mean": float("nan"),
+                "source_loss_std": float("nan"),
+                "source_confidence_mean": float("nan"),
             }
             continue
 
@@ -1870,6 +2154,11 @@ def run_target_construction_diagnostics(
             "source_size": _safe_finite_mean(values["source_size"]),
             "source_clean_rate": _safe_finite_mean(values["source_clean_rate"]),
             "source_positive_rate": _safe_finite_mean(values["source_positive_rate"]),
+            "source_effective_size": _safe_finite_mean(values["source_effective_size"]),
+            "source_loss_mean": _safe_finite_mean(values["source_loss_mean"]),
+            "source_loss_std": _safe_finite_mean(values["source_loss_std"]),
+            "source_confidence_mean": _safe_finite_mean(values["source_confidence_mean"]),
+            "source_label_hist": _mean_label_hist(values["source_label_hist"]),
             "oracle_mean": oracle_mean,
             "oracle_std": float(np.nanstd(oracle)),
             "oracle_positive_rate": float(np.mean(oracle[finite_oracle] > 0.0)) if finite_oracle.any() else float("nan"),
@@ -1914,6 +2203,7 @@ def run_target_construction_diagnostics(
 
 def compute_target_align_scores(
     model: CNN,
+    teacher_model: CNN,
     optimizer: torch.optim.Optimizer,
     images: torch.Tensor,
     labels: torch.Tensor,
@@ -1952,7 +2242,13 @@ def compute_target_align_scores(
                         clean_rate=float("nan"),
                         positive_rate=float(teacher_conf[source_idx].mean().item()),
                     )
-            elif args.target_align_source == "purified_buffer":
+            elif args.target_align_source in {
+                "purified_buffer",
+                "purified_buffer_balanced",
+                "purified_buffer_moderate",
+                "purified_buffer_coverage",
+                "ema_purified",
+            }:
                 source_features, source_errors, meta = build_purified_buffer_source(
                     model,
                     base_train_dataset,
@@ -1961,6 +2257,9 @@ def compute_target_align_scores(
                     max_samples=max(args.target_align_min_source, args.target_align_max_source),
                     min_clean_p=args.replay_admission,
                     min_stability=max(1, args.replay_stability),
+                    variant=args.target_align_source,
+                    teacher_model=teacher_model,
+                    include_clean_meta=False,
                 )
 
             if source_features is None or source_errors is None or source_features.size(0) < args.target_align_min_source:
@@ -2337,6 +2636,7 @@ def train_epoch(
             elif args.utility_mode == "target_align" and args.mstep_mode == "hard":
                 utility_scores, _utility_meta = compute_target_align_scores(
                     model,
+                    teacher_models[m_idx],
                     optimizer,
                     images,
                     labels,
