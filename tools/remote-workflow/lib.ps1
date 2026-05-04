@@ -83,7 +83,14 @@ decode_arg() {
 '@ + "`n" + $Script
     $wrapper = $wrapper -replace "`r", ""
 
-    $sshArgs = @("-p", [string]$Config.Port, $target, "bash", "-s", "--") + $encodedArgs
+    $sshArgs = @(
+        "-o", "ClearAllForwardings=yes",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ExitOnForwardFailure=no",
+        "-p", [string]$Config.Port,
+        $target,
+        "bash", "-s", "--"
+    ) + $encodedArgs
 
     if ($CaptureOutput) {
         $output = $wrapper | & ssh @sshArgs

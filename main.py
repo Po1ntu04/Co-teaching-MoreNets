@@ -261,6 +261,63 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="results_diag/stage2_oracle",
         help="directory for oracle diagnostic JSON/JSONL outputs",
     )
+    # ------------------------------------------------------------------------
+    # Stage-3 target construction diagnostics. These options only add logging.
+    # They ask whether non-clean target sources can approximate the clean
+    # validation one-step oracle well enough to justify utility weighting.
+    parser.add_argument(
+        "--diag_target_construction",
+        action="store_true",
+        help="enable target-source construction diagnostics",
+    )
+    parser.add_argument(
+        "--diag_target_every_epoch",
+        type=int,
+        default=5,
+        help="run target construction diagnostics every N epochs",
+    )
+    parser.add_argument(
+        "--diag_target_batches",
+        type=int,
+        default=2,
+        help="number of train batches for target construction diagnostics",
+    )
+    parser.add_argument(
+        "--diag_target_val_batches",
+        type=int,
+        default=1,
+        help="number of validation/source batches for target construction diagnostics",
+    )
+    parser.add_argument(
+        "--diag_target_candidates",
+        type=int,
+        default=128,
+        help="max peer-selected candidates per model/batch for target construction scoring",
+    )
+    parser.add_argument(
+        "--diag_target_sources",
+        type=str,
+        default="clean_val,noisy_val,peer_consensus,ema_teacher,purified_buffer",
+        help="comma-separated target sources: clean_val,noisy_val,peer_consensus,ema_teacher,purified_buffer",
+    )
+    parser.add_argument(
+        "--diag_target_top_frac",
+        type=float,
+        default=0.25,
+        help="top fraction used when constructing consensus/teacher target sources",
+    )
+    parser.add_argument(
+        "--diag_target_min_source",
+        type=int,
+        default=16,
+        help="minimum source samples required before scoring a constructed target",
+    )
+    parser.add_argument(
+        "--diag_target_output_dir",
+        type=str,
+        default="results_diag/stage3_target_construction",
+        help="directory for target construction diagnostic JSON/JSONL outputs",
+    )
     return parser
 
 
@@ -738,6 +795,10 @@ def _safe_auc(scores: np.ndarray, labels: np.ndarray) -> float:
 def last_layer_error(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     probs = logits.softmax(dim=1)
     return probs - F.one_hot(labels, num_classes=logits.size(1)).to(dtype=probs.dtype)
+
+
+def last_layer_error_from_probs(logits: torch.Tensor, target_probs: torch.Tensor) -> torch.Tensor:
+    return logits.softmax(dim=1) - target_probs.to(dtype=logits.dtype)
 
 
 def adam_last_layer_denominators(model: torch.nn.Module, optimizer: torch.optim.Optimizer) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1311,6 +1372,425 @@ def run_utility_oracle_diagnostics(
     return {"oracle": summaries, "sample_file": samples_path, "summary_file": summary_path}
 
 
+def parse_target_sources(raw_sources: str) -> List[str]:
+    allowed = {"clean_val", "noisy_val", "peer_consensus", "ema_teacher", "purified_buffer"}
+    sources = []
+    for item in str(raw_sources).split(","):
+        source = item.strip()
+        if not source:
+            continue
+        if source not in allowed:
+            raise ValueError(f"Unsupported diag target source: {source}")
+        if source not in sources:
+            sources.append(source)
+    return sources
+
+
+def _top_fraction_indices(scores: torch.Tensor, fraction: float, min_count: int = 1) -> torch.Tensor:
+    if scores.numel() == 0:
+        return torch.empty(0, device=scores.device, dtype=torch.long)
+    valid = torch.isfinite(scores)
+    if not valid.any():
+        return torch.empty(0, device=scores.device, dtype=torch.long)
+    valid_indices = torch.where(valid)[0]
+    k = max(int(min_count), int(math.ceil(float(valid_indices.numel()) * float(fraction))))
+    k = min(k, int(valid_indices.numel()))
+    order = torch.argsort(scores[valid_indices], descending=True)
+    return valid_indices[order[:k]]
+
+
+def _source_meta(size: int = 0, clean_rate: float = float("nan"), positive_rate: float = float("nan")) -> Dict[str, float]:
+    return {
+        "source_size": int(size),
+        "source_clean_rate": float(clean_rate),
+        "source_positive_rate": float(positive_rate),
+    }
+
+
+def _safe_ratio(numer: float, denom: float) -> float:
+    if not math.isfinite(float(numer)) or not math.isfinite(float(denom)) or abs(float(denom)) <= 1e-12:
+        return float("nan")
+    return float(numer) / float(denom)
+
+
+def build_purified_buffer_source(
+    model: CNN,
+    base_train_dataset,
+    purified_replay: PurifiedReplayBuffer,
+    device: torch.device,
+    max_samples: int,
+    min_clean_p: float,
+    min_stability: int,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+    if purified_replay is None or len(purified_replay) == 0:
+        return None, None, _source_meta()
+
+    indices = purified_replay.get_high_quality_indices(min_clean_p=min_clean_p, min_stability=min_stability)
+    if indices.size == 0:
+        indices = np.asarray(purified_replay.indices, dtype=np.int64)
+    if indices.size == 0:
+        return None, None, _source_meta()
+    if max_samples > 0 and indices.size > max_samples:
+        indices = indices[:max_samples]
+
+    samples = [base_train_dataset[int(idx)] for idx in indices]
+    images, noisy_labels, returned_indices = zip(*samples)
+    images = torch.stack(list(images), dim=0).to(device, non_blocking=True)
+    noisy_labels = torch.tensor(noisy_labels, device=device, dtype=torch.long)
+    returned_indices_np = np.asarray(returned_indices, dtype=np.int64)
+    noisy_np = noisy_labels.detach().cpu().numpy().astype(np.int64)
+    clean_flags = get_clean_mask(base_train_dataset, returned_indices_np, noisy_np)
+    with torch.no_grad():
+        features, logits = _feature_logits(model, images)
+        errors = last_layer_error(logits, noisy_labels)
+    return features.detach(), errors.detach(), _source_meta(
+        size=int(len(indices)),
+        clean_rate=float(clean_flags.mean()) if clean_flags.size else float("nan"),
+    )
+
+
+def run_target_construction_diagnostics(
+    epoch: int,
+    args,
+    models: List[torch.nn.Module],
+    teacher_models: List[torch.nn.Module],
+    optimizers: List[torch.optim.Optimizer],
+    train_loader,
+    val_loader,
+    base_train_dataset,
+    remember_rate: float,
+    active_mask: List[bool],
+    purified_replay: PurifiedReplayBuffer = None,
+) -> Dict:
+    """
+    Stage-3 diagnostic: compare constructed target gradients against a clean
+    validation one-step oracle. This does not change training updates.
+    """
+    if train_loader is None or val_loader is None:
+        return {}
+
+    target_sources = parse_target_sources(args.diag_target_sources)
+    if not target_sources:
+        return {}
+
+    ensure_dir(args.diag_target_output_dir)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    was_training = [model.training for model in models]
+    teacher_was_training = [teacher.training for teacher in teacher_models]
+    for model in models:
+        model.eval()
+    for teacher in teacher_models:
+        teacher.eval()
+
+    val_images_parts = []
+    val_noisy_parts = []
+    val_clean_parts = []
+    val_index_parts = []
+    with torch.no_grad():
+        for batch_idx, (images, labels, indices) in enumerate(val_loader):
+            if batch_idx >= args.diag_target_val_batches:
+                break
+            idx_np = indices.numpy().astype(np.int64)
+            val_images_parts.append(images.to(device, non_blocking=True))
+            val_noisy_parts.append(labels.to(device, non_blocking=True).long())
+            val_index_parts.append(indices.to(device, non_blocking=True).long())
+            clean_np = get_clean_labels(base_train_dataset, idx_np)
+            val_clean_parts.append(torch.tensor(clean_np, device=device, dtype=torch.long))
+
+    if not val_images_parts:
+        for model, training in zip(models, was_training):
+            model.train(training)
+        for teacher, training in zip(teacher_models, teacher_was_training):
+            teacher.train(training)
+        return {}
+
+    val_images = torch.cat(val_images_parts, dim=0)
+    val_noisy_labels = torch.cat(val_noisy_parts, dim=0)
+    val_clean_labels = torch.cat(val_clean_parts, dim=0)
+    val_indices = torch.cat(val_index_parts, dim=0)
+    val_idx_np = val_indices.detach().cpu().numpy().astype(np.int64)
+    val_noisy_np = val_noisy_labels.detach().cpu().numpy().astype(np.int64)
+    val_clean_flags_np = get_clean_mask(base_train_dataset, val_idx_np, val_noisy_np)
+
+    active_indices = [i for i, is_active in enumerate(active_mask) if is_active]
+    if not active_indices:
+        active_indices = list(range(len(models)))
+    active_mask_tensor = torch.tensor(active_mask, device=device, dtype=torch.bool)
+
+    with torch.no_grad():
+        val_student_logits = [model(val_images) for model in models]
+        val_teacher_logits = [teacher(val_images) for teacher in teacher_models]
+        val_student_probs = [logits.softmax(dim=1) for logits in val_student_logits]
+        val_teacher_probs = [logits.softmax(dim=1) for logits in val_teacher_logits]
+        val_committee_probs = torch.stack([val_student_probs[i] for i in active_indices], dim=0).mean(dim=0)
+        val_teacher_committee_probs = torch.stack([val_teacher_probs[i] for i in active_indices], dim=0).mean(dim=0)
+        val_consensus_conf, val_consensus_pred = val_committee_probs.max(dim=1)
+        val_teacher_conf, _ = val_teacher_committee_probs.max(dim=1)
+
+    source_cache: Dict[Tuple[int, str], Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]] = {}
+    clean_oracle_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+    with torch.no_grad():
+        peer_base_mask = val_consensus_pred.eq(val_noisy_labels)
+        peer_scores = val_consensus_conf.clone()
+        peer_scores[~peer_base_mask] = -float("inf")
+        peer_idx = _top_fraction_indices(peer_scores, args.diag_target_top_frac, args.diag_target_min_source)
+        if peer_idx.numel() < args.diag_target_min_source:
+            peer_idx = _top_fraction_indices(val_consensus_conf, args.diag_target_top_frac, args.diag_target_min_source)
+
+        teacher_idx = _top_fraction_indices(val_teacher_conf, args.diag_target_top_frac, args.diag_target_min_source)
+
+        for m_idx, model in enumerate(models):
+            val_features, val_logits = _feature_logits(model, val_images)
+            clean_oracle_cache[m_idx] = (val_features.detach(), val_logits.detach(), val_clean_labels.detach())
+
+            if "clean_val" in target_sources:
+                source_cache[(m_idx, "clean_val")] = (
+                    val_features.detach(),
+                    last_layer_error(val_logits, val_clean_labels).detach(),
+                    _source_meta(size=val_images.size(0), clean_rate=float(val_clean_flags_np.mean())),
+                )
+            if "noisy_val" in target_sources:
+                source_cache[(m_idx, "noisy_val")] = (
+                    val_features.detach(),
+                    last_layer_error(val_logits, val_noisy_labels).detach(),
+                    _source_meta(size=val_images.size(0), clean_rate=float(val_clean_flags_np.mean())),
+                )
+            if "peer_consensus" in target_sources and peer_idx.numel() >= args.diag_target_min_source:
+                peer_np = peer_idx.detach().cpu().numpy().astype(np.int64)
+                source_cache[(m_idx, "peer_consensus")] = (
+                    val_features[peer_idx].detach(),
+                    last_layer_error(val_logits[peer_idx], val_consensus_pred[peer_idx]).detach(),
+                    _source_meta(
+                        size=int(peer_idx.numel()),
+                        clean_rate=float(val_clean_flags_np[peer_np].mean()),
+                        positive_rate=float(peer_base_mask[peer_idx].float().mean().item()),
+                    ),
+                )
+            if "ema_teacher" in target_sources and teacher_idx.numel() >= args.diag_target_min_source:
+                teacher_np = teacher_idx.detach().cpu().numpy().astype(np.int64)
+                source_cache[(m_idx, "ema_teacher")] = (
+                    val_features[teacher_idx].detach(),
+                    last_layer_error_from_probs(val_logits[teacher_idx], val_teacher_committee_probs[teacher_idx]).detach(),
+                    _source_meta(
+                        size=int(teacher_idx.numel()),
+                        clean_rate=float(val_clean_flags_np[teacher_np].mean()),
+                        positive_rate=float(val_teacher_conf[teacher_idx].mean().item()),
+                    ),
+                )
+            if "purified_buffer" in target_sources:
+                source_features, source_errors, meta = build_purified_buffer_source(
+                    model,
+                    base_train_dataset,
+                    purified_replay,
+                    device,
+                    max_samples=max(args.diag_target_min_source, args.diag_target_candidates * 4),
+                    min_clean_p=args.replay_admission,
+                    min_stability=max(1, args.replay_stability),
+                )
+                if source_features is not None and source_features.size(0) >= args.diag_target_min_source:
+                    source_cache[(m_idx, "purified_buffer")] = (source_features, source_errors, meta)
+
+    per_source_values: Dict[str, Dict[str, List[float]]] = {
+        source: {
+            "oracle": [],
+            "proxy_raw": [],
+            "proxy_adam": [],
+            "neg_loss": [],
+            "clean": [],
+            "source_size": [],
+            "source_clean_rate": [],
+            "source_positive_rate": [],
+        }
+        for source in target_sources
+    }
+    records = []
+
+    for batch_idx, (images, labels, indices) in enumerate(train_loader):
+        if batch_idx >= args.diag_target_batches:
+            break
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True).long()
+        indices = indices.to(device, non_blocking=True)
+        idx_np = indices.detach().cpu().numpy().astype(np.int64)
+        noisy_np = labels.detach().cpu().numpy().astype(np.int64)
+        clean_np = get_clean_labels(base_train_dataset, idx_np)
+        clean_flags = get_clean_mask(base_train_dataset, idx_np, noisy_np)
+
+        with torch.no_grad():
+            logits_list = [model(images) for model in models]
+            loss_stack = torch.stack([F.cross_entropy(logits, labels, reduction="none") for logits in logits_list])
+
+        for m_idx, model in enumerate(models):
+            agg_loss = aggregate_losses(loss_stack, m_idx, active_mask_tensor, mode=args.aggregation)
+            k = max(1, int(math.ceil(remember_rate * labels.size(0))))
+            k = min(k, labels.size(0))
+            selected = torch.topk(agg_loss, k, largest=False).indices
+            selected_sorted = selected[torch.argsort(agg_loss[selected])]
+            if args.diag_target_candidates > 0 and selected_sorted.numel() > args.diag_target_candidates:
+                pick = torch.linspace(
+                    0,
+                    selected_sorted.numel() - 1,
+                    steps=args.diag_target_candidates,
+                    device=selected_sorted.device,
+                ).round().long()
+                selected_sorted = selected_sorted[pick].unique()
+
+            cand = selected_sorted
+            if cand.numel() == 0:
+                continue
+            cand_np = cand.detach().cpu().numpy().astype(np.int64)
+
+            with torch.no_grad():
+                train_features_all, train_logits_all = _feature_logits(model, images)
+                train_errors_all = last_layer_error(train_logits_all, labels)
+                cand_features = train_features_all[cand].detach()
+                cand_errors = train_errors_all[cand].detach()
+                cand_loss = agg_loss[cand].detach()
+                clean_val_features, clean_val_logits, clean_val_labels = clean_oracle_cache[m_idx]
+                step_size = float(optimizers[m_idx].param_groups[0].get("lr", args.lr)) / float(max(1, k))
+                clean_oracle = last_layer_one_step_improvement(
+                    model,
+                    cand_features,
+                    cand_errors,
+                    clean_val_features,
+                    clean_val_logits,
+                    clean_val_labels,
+                    step_size=step_size,
+                )
+                denom_w, denom_b = adam_last_layer_denominators(model, optimizers[m_idx])
+
+                for source in target_sources:
+                    source_tuple = source_cache.get((m_idx, source))
+                    if source_tuple is None:
+                        continue
+                    source_features, source_errors, meta = source_tuple
+                    raw_all, adam_all = alignment_scores(
+                        train_features_all,
+                        train_errors_all,
+                        source_features,
+                        source_errors,
+                        denom_w,
+                        denom_b,
+                    )
+                    proxy_raw = raw_all[cand].detach()
+                    proxy_adam = adam_all[cand].detach()
+                    oracle_np = clean_oracle.detach().cpu().numpy().astype(float)
+                    raw_np = proxy_raw.detach().cpu().numpy().astype(float)
+                    adam_np = proxy_adam.detach().cpu().numpy().astype(float)
+                    neg_loss_np = (-cand_loss).detach().cpu().numpy().astype(float)
+                    clean_sel = clean_flags[cand_np].astype(bool)
+
+                    store = per_source_values[source]
+                    store["oracle"].extend(oracle_np.tolist())
+                    store["proxy_raw"].extend(raw_np.tolist())
+                    store["proxy_adam"].extend(adam_np.tolist())
+                    store["neg_loss"].extend(neg_loss_np.tolist())
+                    store["clean"].extend(clean_sel.astype(float).tolist())
+                    store["source_size"].append(float(meta["source_size"]))
+                    store["source_clean_rate"].append(float(meta["source_clean_rate"]))
+                    store["source_positive_rate"].append(float(meta["source_positive_rate"]))
+
+                    for j, local_idx in enumerate(cand_np):
+                        records.append(
+                            {
+                                "epoch": int(epoch),
+                                "batch": int(batch_idx),
+                                "model": int(m_idx),
+                                "source": source,
+                                "index": int(idx_np[local_idx]),
+                                "local_index": int(local_idx),
+                                "noisy_label": int(noisy_np[local_idx]),
+                                "clean_label": int(clean_np[local_idx]),
+                                "is_clean": bool(clean_flags[local_idx]),
+                                "neg_loss": float(neg_loss_np[j]),
+                                "proxy_raw": float(raw_np[j]),
+                                "proxy_adam": float(adam_np[j]),
+                                "clean_oracle_improvement": float(oracle_np[j]),
+                                "oracle_step_size": float(step_size),
+                                "source_size": int(meta["source_size"]),
+                                "source_clean_rate": float(meta["source_clean_rate"]),
+                                "source_positive_rate": float(meta["source_positive_rate"]),
+                            }
+                        )
+
+    summaries = {}
+    for source, values in per_source_values.items():
+        oracle = np.asarray(values["oracle"], dtype=np.float64)
+        proxy_raw = np.asarray(values["proxy_raw"], dtype=np.float64)
+        proxy_adam = np.asarray(values["proxy_adam"], dtype=np.float64)
+        neg_loss = np.asarray(values["neg_loss"], dtype=np.float64)
+        clean = np.asarray(values["clean"], dtype=bool)
+        if oracle.size == 0:
+            summaries[source] = {
+                "epoch": int(epoch),
+                "source": source,
+                "source_available": False,
+                "num_records": 0,
+                "source_size": 0,
+                "source_clean_rate": float("nan"),
+                "source_positive_rate": float("nan"),
+            }
+            continue
+
+        top_oracle = top_fraction_mask(oracle)
+        top_proxy = top_fraction_mask(proxy_adam)
+        top_loss = top_fraction_mask(neg_loss)
+        oracle_mean = _safe_mean(oracle)
+        proxy_top_oracle = _safe_mean(oracle[top_proxy])
+        oracle_top_oracle = _safe_mean(oracle[top_oracle])
+        loss_top_oracle = _safe_mean(oracle[top_loss])
+        finite_oracle = np.isfinite(oracle)
+        summaries[source] = {
+            "epoch": int(epoch),
+            "source": source,
+            "source_available": True,
+            "num_records": int(oracle.size),
+            "source_size": float(np.nanmean(np.asarray(values["source_size"], dtype=np.float64))),
+            "source_clean_rate": float(np.nanmean(np.asarray(values["source_clean_rate"], dtype=np.float64))),
+            "source_positive_rate": float(np.nanmean(np.asarray(values["source_positive_rate"], dtype=np.float64))),
+            "oracle_mean": oracle_mean,
+            "oracle_std": float(np.nanstd(oracle)),
+            "oracle_positive_rate": float(np.mean(oracle[finite_oracle] > 0.0)) if finite_oracle.any() else float("nan"),
+            "candidate_clean_rate": float(clean.mean()) if clean.size else float("nan"),
+            "auc_oracle_clean": _safe_auc(oracle, clean),
+            "auc_proxy_adam_clean": _safe_auc(proxy_adam, clean),
+            "auc_loss_clean": _safe_auc(neg_loss, clean),
+            "pearson_proxy_raw_oracle": pearson_corr(proxy_raw, oracle),
+            "spearman_proxy_raw_oracle": spearman_corr(proxy_raw, oracle),
+            "pearson_proxy_adam_oracle": pearson_corr(proxy_adam, oracle),
+            "spearman_proxy_adam_oracle": spearman_corr(proxy_adam, oracle),
+            "pearson_loss_oracle": pearson_corr(neg_loss, oracle),
+            "spearman_loss_oracle": spearman_corr(neg_loss, oracle),
+            "top25_oracle_mean_by_oracle": oracle_top_oracle,
+            "top25_oracle_mean_by_proxy": proxy_top_oracle,
+            "top25_oracle_mean_by_loss": loss_top_oracle,
+            "top25_oracle_lift_by_proxy": proxy_top_oracle - oracle_mean,
+            "top25_oracle_ratio_by_proxy": _safe_ratio(proxy_top_oracle, oracle_mean),
+            "top25_oracle_lift_by_loss": loss_top_oracle - oracle_mean,
+            "top25_clean_rate_by_oracle": _clean_rate(top_oracle, clean),
+            "top25_clean_rate_by_proxy": _clean_rate(top_proxy, clean),
+            "top25_clean_rate_by_loss": _clean_rate(top_loss, clean),
+        }
+
+    summary_path = os.path.join(args.diag_target_output_dir, "target_construction_summary.jsonl")
+    samples_path = os.path.join(args.diag_target_output_dir, f"target_construction_epoch_{epoch:04d}.jsonl")
+    with open(summary_path, "a") as f:
+        for source in sorted(summaries):
+            f.write(json.dumps(summaries[source]) + "\n")
+    with open(samples_path, "w") as f:
+        for record in records:
+            f.write(json.dumps(record) + "\n")
+
+    for model in models:
+        model.zero_grad()
+    for model, training in zip(models, was_training):
+        model.train(training)
+    for teacher, training in zip(teacher_models, teacher_was_training):
+        teacher.train(training)
+    return {"target_construction": summaries, "sample_file": samples_path, "summary_file": summary_path}
+
+
 def load_datasets(args) -> Tuple:
     if args.dataset == "mnist":
         input_channel = 1
@@ -1806,7 +2286,7 @@ def main():
         **loader_kwargs,
     )
     diag_train_loader = None
-    if args.diag_alignment or args.diag_oracle:
+    if args.diag_alignment or args.diag_oracle or args.diag_target_construction:
         diag_loader_kwargs = dict(loader_kwargs)
         if args.num_workers > 0:
             diag_loader_kwargs["persistent_workers"] = False
@@ -2010,6 +2490,28 @@ def main():
             if oracle_log:
                 diag_log.update({"utility_oracle": oracle_log})
                 print(f"Oracle diagnostics saved: {oracle_log.get('summary_file', '')}")
+        if (
+            args.diag_target_construction
+            and val_loader is not None
+            and args.diag_target_every_epoch > 0
+            and epoch % args.diag_target_every_epoch == 0
+        ):
+            target_log = run_target_construction_diagnostics(
+                epoch,
+                args,
+                models,
+                teacher_models,
+                optimizers,
+                diag_train_loader,
+                val_loader,
+                base_train_dataset,
+                remember_rate,
+                active_mask,
+                purified_replay,
+            )
+            if target_log:
+                diag_log.update({"target_construction": target_log})
+                print(f"Target construction diagnostics saved: {target_log.get('summary_file', '')}")
         print(
                         f"Epoch [{epoch}/{args.n_epoch}] "
             + " ".join([f"TrainAcc_M{i}:{train_metrics[f'train_acc_{i}']:.2f}%" for i in range(args.num_models)])
