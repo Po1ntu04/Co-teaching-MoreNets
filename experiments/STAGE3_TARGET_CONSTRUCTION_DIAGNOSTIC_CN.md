@@ -66,6 +66,46 @@ python scripts/analyze_stage3_target_construction.py \
   --output results_diag/stage3_target_construction/e31_seed1_summary.json
 ```
 
+## E3.3 Algorithmic Short Run
+
+只有当非 clean target source 在多个 seed 中通过诊断，才进入本节。当前默认只使用更接近最终方法的 `purified_buffer`，不用 `clean_val`，也不使用 `noisy_val` 作为训练目标。
+
+Baseline：
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=<gpu> python -u main.py \
+  --dataset cifar10 --noise_type symmetric --noise_rate 0.4 \
+  --num_models 2 --q_mode loss --mstep_mode hard \
+  --sam_rho 0.05 --optimizer sgd --lr 0.1 --momentum 0.9 --weight_decay 0.0001 \
+  --replay_size 2000 --replay_ratio 0 \
+  --lambda_mode accuracy --lambda_patience 9999 --min_active 2 \
+  --batch_size 512 --num_workers 8 --prefetch_factor 4 --drop_last \
+  --n_epoch 31 --num_iter_per_epoch 100 --num_gradual 10 --epoch_decay_start 80 \
+  --val_split 0.1 --seed 1 \
+  --utility_mode none \
+  --result_dir results_stage3/target_construction_algo_baseline_seed1
+```
+
+Target-align utility：
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=<gpu> python -u main.py \
+  --dataset cifar10 --noise_type symmetric --noise_rate 0.4 \
+  --num_models 2 --q_mode loss --mstep_mode hard \
+  --sam_rho 0.05 --optimizer sgd --lr 0.1 --momentum 0.9 --weight_decay 0.0001 \
+  --replay_size 2000 --replay_ratio 0 \
+  --lambda_mode accuracy --lambda_patience 9999 --min_active 2 \
+  --batch_size 512 --num_workers 8 --prefetch_factor 4 --drop_last \
+  --n_epoch 31 --num_iter_per_epoch 100 --num_gradual 10 --epoch_decay_start 80 \
+  --val_split 0.1 --seed 1 \
+  --utility_mode target_align --utility_strength 0.25 \
+  --target_align_source purified_buffer \
+  --target_align_min_source 16 --target_align_max_source 128 \
+  --result_dir results_stage3/target_construction_algo_target_s025_seed1
+```
+
+若 `0.25` 不伤害 baseline，再试 `--utility_strength 0.5`。若 `0.25` 已明显下降，不应继续加大强度。
+
 ## 判据
 
 - `clean_val` 只用于 sanity check，不进入最终方法。

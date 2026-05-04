@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("smoke", "e31")]
+    [ValidateSet("smoke", "e31", "baseline", "target_s025", "target_s05")]
     [string]$Mode = "smoke",
     [int]$Seed = 1,
     [string]$Branch = "",
@@ -215,6 +215,15 @@ function Get-Stage3RunName {
     if ($Mode -eq "e31") {
         return "e31_seed$Seed"
     }
+    if ($Mode -eq "baseline") {
+        return "algo_baseline_seed$Seed"
+    }
+    if ($Mode -eq "target_s025") {
+        return "algo_target_s025_seed$Seed"
+    }
+    if ($Mode -eq "target_s05") {
+        return "algo_target_s05_seed$Seed"
+    }
     return "smoke_seed$Seed"
 }
 
@@ -231,15 +240,38 @@ function Get-Stage3Command {
     $diagEvery = 1
     $diagBatches = 1
     $diagCandidates = 64
+    $diagArgs = @(
+        "--diag_target_construction --diag_target_every_epoch $diagEvery",
+        "--diag_target_batches $diagBatches --diag_target_val_batches 1 --diag_target_candidates $diagCandidates",
+        "--diag_target_sources clean_val,noisy_val,peer_consensus,ema_teacher,purified_buffer"
+    ) -join " "
+    $utilityArgs = "--utility_mode none"
+
     if ($Mode -eq "e31") {
         $epochs = 31
         $iters = 100
         $diagEvery = 5
         $diagBatches = 2
         $diagCandidates = 128
+        $diagArgs = @(
+            "--diag_target_construction --diag_target_every_epoch $diagEvery",
+            "--diag_target_batches $diagBatches --diag_target_val_batches 1 --diag_target_candidates $diagCandidates",
+            "--diag_target_sources clean_val,noisy_val,peer_consensus,ema_teacher,purified_buffer"
+        ) -join " "
+    }
+    elseif ($Mode -in @("baseline", "target_s025", "target_s05")) {
+        $epochs = 31
+        $iters = 100
+        $diagArgs = ""
+        if ($Mode -eq "target_s025") {
+            $utilityArgs = "--utility_mode target_align --utility_strength 0.25 --target_align_source purified_buffer --target_align_min_source 16 --target_align_max_source 128"
+        }
+        elseif ($Mode -eq "target_s05") {
+            $utilityArgs = "--utility_mode target_align --utility_strength 0.5 --target_align_source purified_buffer --target_align_min_source 16 --target_align_max_source 128"
+        }
     }
 
-    return @(
+    $parts = @(
         "CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=$Gpu python -u main.py",
         "--dataset cifar10 --noise_type symmetric --noise_rate 0.4",
         "--num_models 2 --q_mode loss --mstep_mode hard",
@@ -249,12 +281,12 @@ function Get-Stage3Command {
         "--batch_size $BatchSize --num_workers 8 --prefetch_factor 4 --drop_last",
         "--n_epoch $epochs --num_iter_per_epoch $iters --num_gradual 10 --epoch_decay_start 80",
         "--val_split 0.1 --seed $Seed",
-        "--diag_target_construction --diag_target_every_epoch $diagEvery",
-        "--diag_target_batches $diagBatches --diag_target_val_batches 1 --diag_target_candidates $diagCandidates",
-        "--diag_target_sources clean_val,noisy_val,peer_consensus,ema_teacher,purified_buffer",
+        $utilityArgs,
+        $diagArgs,
         "--result_dir results_stage3/target_construction_$RunName",
         "--diag_target_output_dir results_diag/stage3_target_construction/$RunName"
-    ) -join " "
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    return ($parts -join " ")
 }
 
 $repoRoot = Get-RepoRoot

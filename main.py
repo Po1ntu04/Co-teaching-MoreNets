@@ -143,13 +143,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--utility_mode",
         type=str,
         default="none",
-        choices=["none", "sam_gap"],
+        choices=["none", "sam_gap", "target_align"],
         help="sample utility weighting inside selected samples",
     )
     parser.add_argument("--utility_strength", type=float, default=1.0, help="blend strength for utility weights")
     parser.add_argument("--utility_temp", type=float, default=1.0, help="temperature for standardized utility gap")
     parser.add_argument("--utility_min", type=float, default=0.2, help="minimum utility multiplier")
     parser.add_argument("--utility_max", type=float, default=2.0, help="maximum utility multiplier")
+    parser.add_argument(
+        "--target_align_source",
+        type=str,
+        default="purified_buffer",
+        choices=["purified_buffer", "ema_teacher"],
+        help="target source for utility_mode=target_align",
+    )
+    parser.add_argument("--target_align_top_frac", type=float, default=0.25, help="top teacher-confidence source fraction")
+    parser.add_argument("--target_align_min_source", type=int, default=16, help="minimum target source size")
+    parser.add_argument("--target_align_max_source", type=int, default=128, help="maximum purified-buffer source size")
     # ------------------------------------------------------------------------
     # Replay buffer (stream-like stability)
     parser.add_argument("--replay_size", type=int, default=2000, help="max replay buffer size")
@@ -605,6 +615,109 @@ def sam_gap_weighted_update(
             p.sub_(e_w)
     optimizer.step()
     return clean_loss.item(), perturbed_loss.item(), utility_mean, utility_std, gap_mean
+
+
+def utility_scores_to_weights(
+    selected: torch.Tensor,
+    utility_scores: torch.Tensor,
+    args,
+) -> Tuple[torch.Tensor, float, float, float]:
+    selected = selected.float().detach()
+    utility = torch.zeros_like(selected)
+    selected_mask = selected > 0
+    if not selected_mask.any() or utility_scores is None:
+        utility[selected_mask] = 1.0
+        return utility, 1.0, 0.0, 0.0
+
+    selected_scores = utility_scores.detach()[selected_mask]
+    finite = torch.isfinite(selected_scores)
+    if finite.sum().item() < 2:
+        utility[selected_mask] = 1.0
+        score_mean = float(selected_scores[finite].mean().item()) if finite.any() else 0.0
+        return utility, 1.0, 0.0, score_mean
+
+    valid_scores = selected_scores[finite]
+    score_mean = float(valid_scores.mean().item())
+    centered = selected_scores - valid_scores.mean()
+    scale = valid_scores.std(unbiased=False).clamp(min=1e-6) * max(args.utility_temp, 1e-6)
+    utility_selected = torch.sigmoid(centered / scale) * 2.0
+    utility_selected = torch.where(torch.isfinite(utility_selected), utility_selected, torch.ones_like(utility_selected))
+    utility_selected = utility_selected.clamp(args.utility_min, args.utility_max)
+    utility_selected = utility_selected / utility_selected.mean().clamp(min=1e-6)
+    if args.utility_strength < 1.0:
+        utility_selected = (1.0 - args.utility_strength) + args.utility_strength * utility_selected
+    utility[selected_mask] = utility_selected
+    return (
+        utility,
+        float(utility_selected.mean().item()),
+        float(utility_selected.std(unbiased=False).item()),
+        score_mean,
+    )
+
+
+def target_align_weighted_update(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    images: torch.Tensor,
+    labels: torch.Tensor,
+    hard_selection: torch.Tensor,
+    student_weight: float,
+    utility_scores: torch.Tensor,
+    rho: float,
+    args,
+) -> Tuple[float, float, float, float, float]:
+    """
+    Target-alignment utility weighting restricted to peer-selected samples.
+    The SAM perturbation is computed from the unweighted reliable set; the
+    utility only reweights the final update inside that set.
+    """
+    selected = hard_selection.float().detach()
+    utility, utility_mean, utility_std, score_mean = utility_scores_to_weights(selected, utility_scores, args)
+    weights = selected * utility.detach()
+    denom = selected.sum().clamp(min=1.0)
+    weight_denom = weights.sum().clamp(min=1e-12)
+
+    optimizer.zero_grad()
+    clean_logits = model(images)
+    clean_losses = F.cross_entropy(clean_logits, labels, reduction="none")
+    clean_loss = student_weight * (clean_losses * selected).sum() / denom
+
+    if rho <= 0:
+        weighted_loss = student_weight * (clean_losses * weights).sum() / weight_denom
+        weighted_loss.backward()
+        optimizer.step()
+        return weighted_loss.item(), weighted_loss.item(), utility_mean, utility_std, score_mean
+
+    clean_loss.backward()
+    grad_parts = [p.grad.view(-1) for p in model.parameters() if p.grad is not None]
+    if not grad_parts:
+        optimizer.zero_grad()
+        loss_value = clean_loss.item()
+        return loss_value, loss_value, utility_mean, utility_std, score_mean
+
+    grad_norm = torch.norm(torch.cat(grad_parts), p=2)
+    scale = rho / (grad_norm + 1e-12)
+    e_ws: List[torch.Tensor] = []
+    with torch.no_grad():
+        for p in model.parameters():
+            if p.grad is None:
+                e_ws.append(None)
+                continue
+            e_w = p.grad * scale
+            p.add_(e_w)
+            e_ws.append(e_w)
+
+    optimizer.zero_grad()
+    perturbed_logits = model(images)
+    perturbed_losses = F.cross_entropy(perturbed_logits, labels, reduction="none")
+    perturbed_loss = student_weight * (perturbed_losses * weights).sum() / weight_denom
+    perturbed_loss.backward()
+    with torch.no_grad():
+        for p, e_w in zip(model.parameters(), e_ws):
+            if e_w is not None:
+                p.sub_(e_w)
+    optimizer.step()
+    return clean_loss.item(), perturbed_loss.item(), utility_mean, utility_std, score_mean
 
 
 def evaluate_models(models: List[torch.nn.Module], loader) -> Tuple[List[float], float]:
@@ -1799,6 +1912,74 @@ def run_target_construction_diagnostics(
     return {"target_construction": summaries, "sample_file": samples_path, "summary_file": summary_path}
 
 
+def compute_target_align_scores(
+    model: CNN,
+    optimizer: torch.optim.Optimizer,
+    images: torch.Tensor,
+    labels: torch.Tensor,
+    teacher_probs: torch.Tensor,
+    base_train_dataset,
+    purified_replay: PurifiedReplayBuffer,
+    args,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Compute a non-updating target-alignment score for each sample in the current
+    batch. It never uses clean labels.
+    """
+    device = images.device
+    was_training = model.training
+    model.eval()
+    meta = _source_meta()
+    try:
+        with torch.no_grad():
+            train_features, train_logits = _feature_logits(model, images)
+            train_errors = last_layer_error(train_logits, labels)
+
+            source_features = None
+            source_errors = None
+            if args.target_align_source == "ema_teacher":
+                teacher_conf, _ = teacher_probs.max(dim=1)
+                source_idx = _top_fraction_indices(
+                    teacher_conf,
+                    args.target_align_top_frac,
+                    args.target_align_min_source,
+                )
+                if source_idx.numel() >= args.target_align_min_source:
+                    source_features = train_features[source_idx].detach()
+                    source_errors = last_layer_error_from_probs(train_logits[source_idx], teacher_probs[source_idx]).detach()
+                    meta = _source_meta(
+                        size=int(source_idx.numel()),
+                        clean_rate=float("nan"),
+                        positive_rate=float(teacher_conf[source_idx].mean().item()),
+                    )
+            elif args.target_align_source == "purified_buffer":
+                source_features, source_errors, meta = build_purified_buffer_source(
+                    model,
+                    base_train_dataset,
+                    purified_replay,
+                    device,
+                    max_samples=max(args.target_align_min_source, args.target_align_max_source),
+                    min_clean_p=args.replay_admission,
+                    min_stability=max(1, args.replay_stability),
+                )
+
+            if source_features is None or source_errors is None or source_features.size(0) < args.target_align_min_source:
+                return torch.zeros(labels.size(0), device=device, dtype=torch.float32), meta
+
+            denom_w, denom_b = adam_last_layer_denominators(model, optimizer)
+            _, scores = alignment_scores(
+                train_features,
+                train_errors,
+                source_features,
+                source_errors,
+                denom_w,
+                denom_b,
+            )
+            return scores.detach(), meta
+    finally:
+        model.train(was_training)
+
+
 def load_datasets(args) -> Tuple:
     if args.dataset == "mnist":
         input_channel = 1
@@ -1892,6 +2073,7 @@ def train_epoch(
     for teacher in teacher_models:
         teacher.eval()
     active_mask_tensor = torch.tensor(active_mask, device=device, dtype=torch.bool)
+    base_dataset = train_dataset.dataset if isinstance(train_dataset, Subset) else train_dataset
 
     if bmm is None and args.q_mode == "bmm":
         bmm = BetaMixture1D(max_iters=args.bmm_max_iters)
@@ -1941,7 +2123,6 @@ def train_epoch(
             replay_count = min(replay_count, len(purified_replay))
             if replay_count > 0:
                 replay_idx = purified_replay.sample(replay_count, strategy=args.replay_sample_strategy)
-                base_dataset = train_dataset.dataset if isinstance(train_dataset, Subset) else train_dataset
                 replay_samples = [base_dataset[i] for i in replay_idx]
                 replay_imgs, replay_lbls, replay_ids = zip(*replay_samples)
                 replay_imgs = torch.stack(list(replay_imgs), dim=0)
@@ -1956,7 +2137,6 @@ def train_epoch(
                 replay_count = min(replay_count, len(replay_buffer))
             if replay_count > 0:
                 replay_idx = np.random.choice(replay_buffer, size=replay_count, replace=False)
-                base_dataset = train_dataset.dataset if isinstance(train_dataset, Subset) else train_dataset
                 replay_samples = [base_dataset[i] for i in replay_idx]
                 replay_imgs, replay_lbls, replay_ids = zip(*replay_samples)
                 replay_imgs = torch.stack(list(replay_imgs), dim=0)
@@ -2154,6 +2334,31 @@ def train_epoch(
                 batch_accumulator["utility_weight_mean"][m_idx] += utility_mean
                 batch_accumulator["utility_weight_std"][m_idx] += utility_std
                 batch_accumulator["utility_gap_mean"][m_idx] += utility_gap_mean
+            elif args.utility_mode == "target_align" and args.mstep_mode == "hard":
+                utility_scores, _utility_meta = compute_target_align_scores(
+                    model,
+                    optimizer,
+                    images,
+                    labels,
+                    teacher_probs_for_loss,
+                    base_dataset,
+                    purified_replay,
+                    args,
+                )
+                clean_loss, perturbed_loss, utility_mean, utility_std, utility_score_mean = target_align_weighted_update(
+                    model,
+                    optimizer,
+                    images,
+                    labels,
+                    hard_selection,
+                    student_weight,
+                    utility_scores,
+                    rho=args.sam_rho,
+                    args=args,
+                )
+                batch_accumulator["utility_weight_mean"][m_idx] += utility_mean
+                batch_accumulator["utility_weight_std"][m_idx] += utility_std
+                batch_accumulator["utility_gap_mean"][m_idx] += utility_score_mean
             elif args.sam_rho > 0:
                 clean_loss, perturbed_loss = sam_update(
                     model,
