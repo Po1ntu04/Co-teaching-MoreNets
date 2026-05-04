@@ -407,27 +407,16 @@ if ($NoWait) {
 
 while ($true) {
     Start-Sleep -Seconds $PollSeconds
-    $statusScript = @'
-set -euo pipefail
-SESSION="$1"
-LOG_FILE="$2"
-if tmux has-session -t "$SESSION" 2>/dev/null; then
-    echo "RUNNING"
-    tail -n 20 "$LOG_FILE" || true
-else
-    echo "DONE"
-    tail -n 120 "$LOG_FILE" || true
-fi
-'@
+    $statusCommand = "cd '$($config.RepoDir)' && if tmux has-session -t '$Session' 2>/dev/null; then echo RUNNING; tail -n 20 '$logFile' || true; else echo DONE; tail -n 120 '$logFile' || true; fi"
     $sshArgs = @(
         "-o", "ClearAllForwardings=yes",
         "-o", "StrictHostKeyChecking=accept-new",
         "-o", "ExitOnForwardFailure=no",
         "-p", [string]$config.Port,
         $target,
-        "bash", "-s", "--", $Session, $logFile
+        $statusCommand
     )
-    $status = $statusScript | & ssh @sshArgs
+    $status = & ssh @sshArgs
     if ($LASTEXITCODE -ne 0) {
         throw "Remote status command failed with exit code $LASTEXITCODE."
     }
