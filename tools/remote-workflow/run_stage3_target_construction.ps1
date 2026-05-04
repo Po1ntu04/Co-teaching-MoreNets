@@ -409,8 +409,8 @@ while ($true) {
     Start-Sleep -Seconds $PollSeconds
     $statusScript = @'
 set -euo pipefail
-SESSION="$(decode_arg "$1")"
-LOG_FILE="$(decode_arg "$2")"
+SESSION="$1"
+LOG_FILE="$2"
 if tmux has-session -t "$SESSION" 2>/dev/null; then
     echo "RUNNING"
     tail -n 20 "$LOG_FILE" || true
@@ -419,7 +419,18 @@ else
     tail -n 120 "$LOG_FILE" || true
 fi
 '@
-    $status = Invoke-Stage3RemoteScript -Config $config -Target $target -Script $statusScript -Arguments @($Session, $logFile) -CaptureOutput
+    $sshArgs = @(
+        "-o", "ClearAllForwardings=yes",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ExitOnForwardFailure=no",
+        "-p", [string]$config.Port,
+        $target,
+        "bash", "-s", "--", $Session, $logFile
+    )
+    $status = $statusScript | & ssh @sshArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Remote status command failed with exit code $LASTEXITCODE."
+    }
     $status | ForEach-Object { Write-Host $_ }
     if ($status -contains "DONE") {
         break
