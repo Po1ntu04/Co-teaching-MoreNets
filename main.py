@@ -1652,20 +1652,19 @@ def _safe_ratio(numer: float, denom: float) -> float:
 
 
 def _select_balanced_indices(indices: np.ndarray, labels: np.ndarray, max_samples: int) -> np.ndarray:
-    if indices.size == 0 or max_samples <= 0 or indices.size <= max_samples:
+    if indices.size == 0 or max_samples <= 0:
         return indices
     groups: Dict[int, List[int]] = {}
     for idx, label in zip(indices.tolist(), labels.tolist()):
         groups.setdefault(int(label), []).append(int(idx))
+    if not groups:
+        return indices[:max_samples]
+    per_class_cap = max(1, int(math.ceil(float(max_samples) / float(len(groups)))))
     selected: List[int] = []
-    class_order = sorted(groups, key=lambda key: (len(groups[key]), key))
-    cursor = 0
-    while len(selected) < max_samples and class_order:
-        label = class_order[cursor % len(class_order)]
-        if groups[label]:
-            selected.append(groups[label].pop(0))
-        class_order = [key for key in class_order if groups[key]]
-        cursor += 1
+    for label in sorted(groups):
+        selected.extend(groups[label][:per_class_cap])
+    if len(selected) > max_samples:
+        selected = selected[:max_samples]
     return np.asarray(selected, dtype=np.int64)
 
 
@@ -1675,12 +1674,15 @@ def _select_coverage_indices(
     purified_replay: PurifiedReplayBuffer,
     max_samples: int,
 ) -> np.ndarray:
-    if indices.size == 0 or max_samples <= 0 or indices.size <= max_samples:
+    if indices.size == 0 or max_samples <= 0:
         return indices
     full_counts: Dict[int, int] = {}
     for info in purified_replay.memory.values():
         full_counts[int(info.label)] = full_counts.get(int(info.label), 0) + 1
     max_count = max(full_counts.values()) if full_counts else 1
+    observed_labels = sorted(set(int(label) for label in labels.tolist()))
+    per_class_cap = max(1, int(math.ceil(float(max_samples) / float(max(1, len(observed_labels))))))
+    selected_counts: Dict[int, int] = {}
     scored = []
     for idx, label in zip(indices.tolist(), labels.tolist()):
         info = purified_replay.memory.get(int(idx))
@@ -1690,7 +1692,20 @@ def _select_coverage_indices(
         coverage_need = 1.0 - float(full_counts.get(label, 0)) / float(max_count)
         scored.append((coverage_need, u, q, -full_counts.get(label, 0), int(idx)))
     scored.sort(reverse=True)
-    return np.asarray([item[-1] for item in scored[:max_samples]], dtype=np.int64)
+    selected: List[int] = []
+    for item in scored:
+        idx = int(item[-1])
+        info = purified_replay.memory.get(idx)
+        label = int(info.label) if info is not None else int(labels[np.where(indices == idx)[0][0]])
+        if selected_counts.get(label, 0) >= per_class_cap:
+            continue
+        selected.append(idx)
+        selected_counts[label] = selected_counts.get(label, 0) + 1
+        if len(selected) >= max_samples:
+            break
+    if not selected:
+        selected = [int(item[-1]) for item in scored[:max_samples]]
+    return np.asarray(selected, dtype=np.int64)
 
 
 def build_purified_buffer_source(
@@ -1983,7 +1998,7 @@ def run_target_construction_diagnostics(
                     base_train_dataset,
                     purified_replay,
                     device,
-                    max_samples=max(args.diag_target_min_source, args.diag_target_candidates * 4),
+                    max_samples=max(args.diag_target_min_source, args.diag_target_candidates),
                     min_clean_p=args.replay_admission,
                     min_stability=max(1, args.replay_stability),
                     variant=source,
