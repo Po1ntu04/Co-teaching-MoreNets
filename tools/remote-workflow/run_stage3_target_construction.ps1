@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("smoke", "e31", "baseline", "target_s025", "target_s05", "target_s010", "target_rerank", "target_rerank_pool", "diag_variants")]
+    [ValidateSet("smoke", "e31", "baseline", "target_s025", "target_s05", "target_s010", "target_rerank", "target_rerank_pool", "diag_variants", "diag_variants_selective")]
     [string]$Mode = "smoke",
     [int]$Seed = 1,
     [string]$Branch = "",
@@ -237,6 +237,9 @@ function Get-Stage3RunName {
     if ($Mode -eq "diag_variants") {
         return "stage35_diag_variants_seed$Seed"
     }
+    if ($Mode -eq "diag_variants_selective") {
+        return "stage35_diag_variants_selective_seed$Seed"
+    }
     return "smoke_seed$Seed"
 }
 
@@ -272,7 +275,7 @@ function Get-Stage3Command {
             "--diag_target_sources clean_val,noisy_val,peer_consensus,ema_teacher,purified_buffer"
         ) -join " "
     }
-    elseif ($Mode -eq "diag_variants") {
+    elseif ($Mode -in @("diag_variants", "diag_variants_selective")) {
         $epochs = 31
         $iters = 100
         $diagEvery = 5
