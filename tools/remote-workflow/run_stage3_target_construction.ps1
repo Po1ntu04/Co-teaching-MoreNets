@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("smoke", "e31", "baseline", "target_s025", "target_s05", "target_s010", "target_rerank", "diag_variants")]
+    [ValidateSet("smoke", "e31", "baseline", "target_s025", "target_s05", "target_s010", "target_rerank", "target_rerank_pool", "diag_variants")]
     [string]$Mode = "smoke",
     [int]$Seed = 1,
     [string]$Branch = "",
@@ -231,6 +231,9 @@ function Get-Stage3RunName {
     if ($Mode -eq "target_rerank") {
         return "stage35_target_rerank_seed$Seed"
     }
+    if ($Mode -eq "target_rerank_pool") {
+        return "stage35_target_rerank_pool_seed$Seed"
+    }
     if ($Mode -eq "diag_variants") {
         return "stage35_diag_variants_seed$Seed"
     }
@@ -281,7 +284,7 @@ function Get-Stage3Command {
             "--diag_target_sources clean_val,noisy_val,peer_consensus,ema_teacher,purified_buffer,purified_buffer_balanced,purified_buffer_moderate,purified_buffer_coverage,ema_purified"
         ) -join " "
     }
-    elseif ($Mode -in @("baseline", "target_s025", "target_s05", "target_s010", "target_rerank")) {
+    elseif ($Mode -in @("baseline", "target_s025", "target_s05", "target_s010", "target_rerank", "target_rerank_pool")) {
         $epochs = 31
         $iters = 100
         $diagArgs = ""
@@ -294,7 +297,7 @@ function Get-Stage3Command {
         elseif ($Mode -eq "target_s010") {
             $utilityArgs = "--utility_mode target_align --target_align_mode weighted --utility_strength 0.10 --target_align_source purified_buffer --target_align_min_source 16 --target_align_max_source 128"
         }
-        elseif ($Mode -eq "target_rerank") {
+        elseif ($Mode -in @("target_rerank", "target_rerank_pool")) {
             $utilityArgs = "--utility_mode target_align --target_align_mode rerank_only --target_align_rerank_frac 0.75 --utility_strength 1.0 --target_align_source purified_buffer --target_align_min_source 16 --target_align_max_source 128"
         }
     }

@@ -664,20 +664,8 @@ def utility_scores_to_weights(
     score_mean = float(valid_scores.mean().item())
 
     if getattr(args, "target_align_mode", "weighted") == "rerank_only":
-        selected_utility = torch.zeros_like(selected_scores)
-        keep_frac = min(max(float(args.target_align_rerank_frac), 1e-6), 1.0)
-        keep_count = max(1, int(math.ceil(float(selected_scores.numel()) * keep_frac)))
-        keep_count = min(keep_count, int(finite.sum().item()))
-        finite_indices = torch.where(finite)[0]
-        keep_local = finite_indices[torch.argsort(selected_scores[finite_indices], descending=True)[:keep_count]]
-        selected_utility[keep_local] = 1.0
-        utility[selected_mask] = selected_utility
-        return (
-            utility,
-            float(selected_utility.mean().item()),
-            float(selected_utility.std(unbiased=False).item()),
-            score_mean,
-        )
+        utility[selected_mask] = 1.0
+        return utility, 1.0, 0.0, score_mean
 
     centered = selected_scores - valid_scores.mean()
     scale = valid_scores.std(unbiased=False).clamp(min=1e-6) * max(args.utility_temp, 1e-6)
@@ -694,6 +682,35 @@ def utility_scores_to_weights(
         float(utility_selected.std(unbiased=False).item()),
         score_mean,
     )
+
+
+def rerank_low_loss_selection(
+    agg_loss: torch.Tensor,
+    utility_scores: torch.Tensor,
+    remember_rate: float,
+    args,
+) -> torch.Tensor:
+    """
+    Rerank-only keeps the original selected count. It widens the small-loss
+    candidate pool slightly, then chooses k samples by target alignment.
+    """
+    batch_size = int(agg_loss.numel())
+    k = max(1, int(math.ceil(float(remember_rate) * float(batch_size))))
+    k = min(k, batch_size)
+    keep_frac = min(max(float(args.target_align_rerank_frac), 1e-6), 1.0)
+    pool_k = max(k, int(math.ceil(float(k) / keep_frac)))
+    pool_k = min(pool_k, batch_size)
+    low_loss_pool = torch.topk(agg_loss, pool_k, largest=False).indices
+    if utility_scores is None or utility_scores.numel() != batch_size:
+        return low_loss_pool[:k]
+    pool_scores = utility_scores.detach()[low_loss_pool]
+    finite = torch.isfinite(pool_scores)
+    if finite.sum().item() < k:
+        return low_loss_pool[:k]
+    finite_pool = low_loss_pool[finite]
+    finite_scores = pool_scores[finite]
+    order = torch.argsort(finite_scores, descending=True)
+    return finite_pool[order[:k]]
 
 
 def target_align_weighted_update(
@@ -2645,6 +2662,11 @@ def train_epoch(
                     purified_replay,
                     args,
                 )
+                if getattr(args, "target_align_mode", "weighted") == "rerank_only":
+                    rerank_loss = aggregate_losses(loss_stack, m_idx, active_mask_tensor, mode=args.aggregation)
+                    sel = rerank_low_loss_selection(rerank_loss, utility_scores, remember_rate, args)
+                    hard_selection = torch.zeros(batch_size, device=images.device, dtype=torch.float32)
+                    hard_selection[sel] = 1.0
                 clean_loss, perturbed_loss, utility_mean, utility_std, utility_score_mean = target_align_weighted_update(
                     model,
                     optimizer,
