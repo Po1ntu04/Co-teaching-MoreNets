@@ -59,6 +59,9 @@ def summarize_process(path: str, last_k: int) -> Dict[str, Any]:
         "mstep_mode": config.get("mstep_mode"),
         "q_gate_pool_mult": config.get("q_gate_pool_mult"),
         "sam_rho": config.get("sam_rho"),
+        "selection_diversity_strength": config.get("selection_diversity_strength"),
+        "selection_diversity_start_epoch": config.get("selection_diversity_start_epoch"),
+        "selection_diversity_ramp_epochs": config.get("selection_diversity_ramp_epochs"),
         "epochs_completed": len(epochs),
         "best_epoch": best_epoch.get("epoch"),
         "best_acc": best_epoch.get("test_acc"),
@@ -81,6 +84,9 @@ def summarize_process(path: str, last_k: int) -> Dict[str, Any]:
         "last5_within_overlap_delta": finite_mean(proc(e, "overlap_delta") for e in tail),
         "last5_within_selected_clean_delta": finite_mean(proc(e, "selected_clean_rate_delta") for e in tail),
         "last5_selector_changed_frac": finite_mean(proc(e, "selector_changed_frac_mean") for e in tail),
+        "last5_selection_diversity_effective_strength": finite_mean(
+            proc(e, "selection_diversity_effective_strength_mean") for e in tail
+        ),
         "last5_base_selected_in_gate_rate": finite_mean(proc(e, "base_selected_in_gate_rate_mean") for e in tail),
         "last5_within_grad_norm_mean": finite_mean(proc(e, "grad_norm_mean_mean") for e in tail),
         "last5_within_update_to_param_mean": finite_mean(proc(e, "update_to_param_mean_mean") for e in tail),

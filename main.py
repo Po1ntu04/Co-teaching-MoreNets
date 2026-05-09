@@ -312,6 +312,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=1,
         help="first training epoch that can use diversity-aware selection",
     )
+    parser.add_argument(
+        "--selection_diversity_ramp_epochs",
+        type=int,
+        default=0,
+        help="if >0, linearly ramp diversity strength after start epoch over this many epochs",
+    )
     # ------------------------------------------------------------------------
     # Stage-1 target-utility diagnostics. These options only add logging and do
     # not change the training update path.
@@ -684,6 +690,7 @@ def summarize_process_records(records: List[Dict[str, float]], bins: int) -> Dic
         "selected_clean_rate",
         "overlap",
         "selector_changed_frac",
+        "selection_diversity_effective_strength",
         "base_selected_in_gate_rate",
         "selected_q_mean",
         "unselected_q_mean",
@@ -2806,11 +2813,19 @@ def train_epoch(
             selected = torch.topk(agg_loss, k, largest=False).indices
             selections.append(selected)
         base_selections = [sel.detach().clone() for sel in selections]
+        selection_diversity_effective_strength = 0.0
+        if args.selection_diversity_strength > 0 and epoch >= args.selection_diversity_start_epoch:
+            selection_diversity_effective_strength = float(args.selection_diversity_strength)
+            if args.selection_diversity_ramp_epochs > 0:
+                ramp_pos = (epoch - args.selection_diversity_start_epoch + 1) / float(
+                    max(1, args.selection_diversity_ramp_epochs)
+                )
+                ramp_pos = max(0.0, min(1.0, ramp_pos))
+                selection_diversity_effective_strength *= ramp_pos
         pre_q_selector_changed_frac = 0.0
         if (
-            args.selection_diversity_strength > 0
+            selection_diversity_effective_strength > 0
             and args.selection_diversity_q_gate_mult <= 0
-            and epoch >= args.selection_diversity_start_epoch
         ):
             diversity_selections: List[Optional[torch.Tensor]] = [None for _ in range(len(models))]
             selected_counts = torch.zeros(batch_size, device=images.device, dtype=torch.float32)
@@ -2828,7 +2843,7 @@ def train_epoch(
                 candidate_mask = torch.zeros(batch_size, device=images.device, dtype=torch.bool)
                 candidate_mask[candidate_idx] = True
                 loss_scale = agg_loss.detach().float().std(unbiased=False).clamp_min(1e-6)
-                score = agg_loss + float(args.selection_diversity_strength) * loss_scale * selected_counts
+                score = agg_loss + selection_diversity_effective_strength * loss_scale * selected_counts
                 score = score.clone()
                 score[~candidate_mask] = float("inf")
                 selected = torch.topk(score, k, largest=False).indices
@@ -2934,9 +2949,8 @@ def train_epoch(
         selector_changed_frac = float(pre_q_selector_changed_frac)
         base_selected_in_gate_rate = 0.0
         if (
-            args.selection_diversity_strength > 0
+            selection_diversity_effective_strength > 0
             and args.selection_diversity_q_gate_mult > 0
-            and epoch >= args.selection_diversity_start_epoch
         ):
             k = max(1, int(math.ceil(remember_rate * batch_size)))
             k = min(k, batch_size)
@@ -2968,7 +2982,7 @@ def train_epoch(
                 if int(candidate_mask.sum().item()) < k:
                     candidate_mask = low_pool_mask
                 loss_scale = agg_loss.detach().float().std(unbiased=False).clamp_min(1e-6)
-                score = agg_loss + float(args.selection_diversity_strength) * loss_scale * selected_counts
+                score = agg_loss + selection_diversity_effective_strength * loss_scale * selected_counts
                 score = score.clone()
                 score[~candidate_mask] = float("inf")
                 selected = torch.topk(score, k, largest=False).indices
@@ -3091,6 +3105,7 @@ def train_epoch(
                 "selected_clean_rate": _safe_float(batch_selected_clean_rate, default=0.0),
                 "overlap": float(current_overlap),
                 "selector_changed_frac": float(selector_changed_frac),
+                "selection_diversity_effective_strength": float(selection_diversity_effective_strength),
                 "base_selected_in_gate_rate": float(base_selected_in_gate_rate),
                 "selected_any_frac": float(selected_any.float().mean().item()),
                 "selected_all_frac": float(selected_all.float().mean().item()),
