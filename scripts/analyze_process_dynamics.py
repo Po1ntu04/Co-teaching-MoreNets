@@ -80,6 +80,8 @@ def summarize_process(path: str, last_k: int) -> Dict[str, Any]:
         "last5_within_q_std_delta": finite_mean(proc(e, "q_std_delta") for e in tail),
         "last5_within_overlap_delta": finite_mean(proc(e, "overlap_delta") for e in tail),
         "last5_within_selected_clean_delta": finite_mean(proc(e, "selected_clean_rate_delta") for e in tail),
+        "last5_selector_changed_frac": finite_mean(proc(e, "selector_changed_frac_mean") for e in tail),
+        "last5_base_selected_in_gate_rate": finite_mean(proc(e, "base_selected_in_gate_rate_mean") for e in tail),
         "last5_within_grad_norm_mean": finite_mean(proc(e, "grad_norm_mean_mean") for e in tail),
         "last5_within_update_to_param_mean": finite_mean(proc(e, "update_to_param_mean_mean") for e in tail),
         "last5_selected_q_gap": finite_mean(
@@ -90,6 +92,7 @@ def summarize_process(path: str, last_k: int) -> Dict[str, Any]:
         ),
         "last5_gate_pool_frac": finite_mean(proc(e, "gate_pool_frac_mean") for e in tail),
         "last5_gate_pool_clean_rate": finite_mean(proc(e, "gate_pool_clean_rate_mean") for e in tail),
+        "last5_gate_pool_q_mean": finite_mean(proc(e, "gate_pool_q_mean_mean") for e in tail),
     }
     return row
 

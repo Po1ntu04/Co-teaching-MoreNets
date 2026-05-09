@@ -640,12 +640,15 @@ def summarize_process_records(records: List[Dict[str, float]], bins: int) -> Dic
         "q_clean_auc",
         "selected_clean_rate",
         "overlap",
+        "selector_changed_frac",
+        "base_selected_in_gate_rate",
         "selected_q_mean",
         "unselected_q_mean",
         "selected_loss_mean",
         "unselected_loss_mean",
         "gate_pool_frac",
         "gate_pool_clean_rate",
+        "gate_pool_q_mean",
         "grad_norm_mean",
         "update_norm_mean",
         "update_to_param_mean",
@@ -2759,6 +2762,7 @@ def train_epoch(
             k = min(k, batch_size)
             selected = torch.topk(agg_loss, k, largest=False).indices
             selections.append(selected)
+        base_selections = [sel.detach().clone() for sel in selections]
 
         current_overlap = selection_overlap(selections, batch_size, images.device, active_mask)
 
@@ -2854,11 +2858,22 @@ def train_epoch(
         gate_pool_frac = 0.0
         gate_pool_clean_rate = 0.0
         gate_pool_q_mean = 0.0
+        selector_changed_frac = 0.0
+        base_selected_in_gate_rate = 0.0
         if q_flags["selection"]:
             k = max(1, int(math.ceil(remember_rate * batch_size)))
             k = min(k, batch_size)
             q_selected = torch.topk(Q_i, k, largest=True).indices
             selections = [q_selected for _ in range(len(models))]
+            change_rates: List[float] = []
+            for base_sel in base_selections:
+                base_mask = torch.zeros(batch_size, device=images.device, dtype=torch.bool)
+                new_mask = torch.zeros(batch_size, device=images.device, dtype=torch.bool)
+                base_mask[base_sel] = True
+                new_mask[q_selected] = True
+                common = (base_mask & new_mask).float().sum().item()
+                change_rates.append(1.0 - common / max(1.0, float(min(base_sel.numel(), q_selected.numel()))))
+            selector_changed_frac = float(np.mean(change_rates)) if change_rates else 0.0
         elif q_flags["gate"]:
             k = max(1, int(math.ceil(remember_rate * batch_size)))
             k = min(k, batch_size)
@@ -2874,11 +2889,24 @@ def train_epoch(
                 clean_tensor_for_pool = torch.tensor(clean_np, device=images.device, dtype=torch.float32)
                 gate_pool_clean_rate = _tensor_mean_or_zero(clean_tensor_for_pool[pool_mask])
             gated_selections: List[torch.Tensor] = []
+            base_in_gate_rates: List[float] = []
+            change_rates = []
             for m_idx in range(len(models)):
                 agg_loss = aggregate_losses(loss_stack, m_idx, active_mask_tensor, mode=args.aggregation).clone()
                 agg_loss[~pool_mask] = float("inf")
-                gated_selections.append(torch.topk(agg_loss, k, largest=False).indices)
+                gated_sel = torch.topk(agg_loss, k, largest=False).indices
+                gated_selections.append(gated_sel)
+                base_sel = base_selections[m_idx]
+                base_in_gate_rates.append(float(pool_mask[base_sel].float().mean().item()) if base_sel.numel() else 0.0)
+                base_mask = torch.zeros(batch_size, device=images.device, dtype=torch.bool)
+                gated_mask = torch.zeros(batch_size, device=images.device, dtype=torch.bool)
+                base_mask[base_sel] = True
+                gated_mask[gated_sel] = True
+                common = (base_mask & gated_mask).float().sum().item()
+                change_rates.append(1.0 - common / max(1.0, float(min(base_sel.numel(), gated_sel.numel()))))
             selections = gated_selections
+            base_selected_in_gate_rate = float(np.mean(base_in_gate_rates)) if base_in_gate_rates else 0.0
+            selector_changed_frac = float(np.mean(change_rates)) if change_rates else 0.0
 
         current_overlap = selection_overlap(selections, batch_size, images.device, active_mask)
         batch_accumulator["overlap"].append(current_overlap)
@@ -2955,6 +2983,8 @@ def train_epoch(
                 "q_clean_auc": _safe_float(batch_q_auc, default=0.0),
                 "selected_clean_rate": _safe_float(batch_selected_clean_rate, default=0.0),
                 "overlap": float(current_overlap),
+                "selector_changed_frac": float(selector_changed_frac),
+                "base_selected_in_gate_rate": float(base_selected_in_gate_rate),
                 "selected_any_frac": float(selected_any.float().mean().item()),
                 "selected_all_frac": float(selected_all.float().mean().item()),
                 "selected_vote_mean": float(selection_counts.mean().item()),
