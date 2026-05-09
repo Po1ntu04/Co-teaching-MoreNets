@@ -288,6 +288,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # Explore sampling (diversity preservation when overlap is high)
     parser.add_argument("--explore_delta", type=float, default=0.0, help="fraction of batch for explore sampling (0=disabled)")
     parser.add_argument("--explore_trigger", type=float, default=0.85, help="overlap threshold to trigger explore sampling")
+    parser.add_argument(
+        "--selection_diversity_strength",
+        type=float,
+        default=0.0,
+        help="penalty strength for selecting samples already chosen by other models inside low-loss candidate pools",
+    )
+    parser.add_argument(
+        "--selection_diversity_pool_mult",
+        type=float,
+        default=1.25,
+        help="candidate-pool multiplier for diversity-aware low-loss selection",
+    )
+    parser.add_argument(
+        "--selection_diversity_start_epoch",
+        type=int,
+        default=1,
+        help="first training epoch that can use diversity-aware selection",
+    )
     # ------------------------------------------------------------------------
     # Stage-1 target-utility diagnostics. These options only add logging and do
     # not change the training update path.
@@ -536,6 +554,25 @@ def selection_overlap(
         overlap = (mask_a & mask_b).sum().float() / mask_a.sum().clamp(min=1)
         overlaps.append(float(overlap.item()))
     return float(max(overlaps)) if overlaps else 0.0
+
+
+def selection_change_rate(
+    reference: Sequence[torch.Tensor],
+    current: Sequence[torch.Tensor],
+    batch_size: int,
+    device: torch.device,
+) -> float:
+    rates: List[float] = []
+    for ref_sel, cur_sel in zip(reference, current):
+        if ref_sel.numel() == 0 or cur_sel.numel() == 0:
+            continue
+        ref_mask = torch.zeros(batch_size, device=device, dtype=torch.bool)
+        cur_mask = torch.zeros(batch_size, device=device, dtype=torch.bool)
+        ref_mask[ref_sel] = True
+        cur_mask[cur_sel] = True
+        common = (ref_mask & cur_mask).float().sum().item()
+        rates.append(1.0 - common / max(1.0, float(min(ref_sel.numel(), cur_sel.numel()))))
+    return float(np.mean(rates)) if rates else 0.0
 
 
 def binary_auc(scores: np.ndarray, labels: np.ndarray) -> float:
@@ -2763,6 +2800,32 @@ def train_epoch(
             selected = torch.topk(agg_loss, k, largest=False).indices
             selections.append(selected)
         base_selections = [sel.detach().clone() for sel in selections]
+        pre_q_selector_changed_frac = 0.0
+        if args.selection_diversity_strength > 0 and epoch >= args.selection_diversity_start_epoch:
+            diversity_selections: List[Optional[torch.Tensor]] = [None for _ in range(len(models))]
+            selected_counts = torch.zeros(batch_size, device=images.device, dtype=torch.float32)
+            model_order = list(range(len(models)))
+            if model_order:
+                shift = (epoch + batch_idx) % len(model_order)
+                model_order = model_order[shift:] + model_order[:shift]
+            for m_idx in model_order:
+                agg_loss = aggregate_losses(loss_stack, m_idx, active_mask_tensor, mode=args.aggregation)
+                k = max(1, int(math.ceil(remember_rate * batch_size)))
+                k = min(k, batch_size)
+                pool_mult = max(1.0, float(args.selection_diversity_pool_mult))
+                pool_k = min(batch_size, max(k, int(math.ceil(pool_mult * k))))
+                candidate_idx = torch.topk(agg_loss, pool_k, largest=False).indices
+                candidate_mask = torch.zeros(batch_size, device=images.device, dtype=torch.bool)
+                candidate_mask[candidate_idx] = True
+                loss_scale = agg_loss.detach().float().std(unbiased=False).clamp_min(1e-6)
+                score = agg_loss + float(args.selection_diversity_strength) * loss_scale * selected_counts
+                score = score.clone()
+                score[~candidate_mask] = float("inf")
+                selected = torch.topk(score, k, largest=False).indices
+                diversity_selections[m_idx] = selected
+                selected_counts[selected] += 1.0
+            selections = [sel if sel is not None else base_selections[m_idx] for m_idx, sel in enumerate(diversity_selections)]
+            pre_q_selector_changed_frac = selection_change_rate(base_selections, selections, batch_size, images.device)
 
         current_overlap = selection_overlap(selections, batch_size, images.device, active_mask)
 
@@ -2858,22 +2921,14 @@ def train_epoch(
         gate_pool_frac = 0.0
         gate_pool_clean_rate = 0.0
         gate_pool_q_mean = 0.0
-        selector_changed_frac = 0.0
+        selector_changed_frac = float(pre_q_selector_changed_frac)
         base_selected_in_gate_rate = 0.0
         if q_flags["selection"]:
             k = max(1, int(math.ceil(remember_rate * batch_size)))
             k = min(k, batch_size)
             q_selected = torch.topk(Q_i, k, largest=True).indices
             selections = [q_selected for _ in range(len(models))]
-            change_rates: List[float] = []
-            for base_sel in base_selections:
-                base_mask = torch.zeros(batch_size, device=images.device, dtype=torch.bool)
-                new_mask = torch.zeros(batch_size, device=images.device, dtype=torch.bool)
-                base_mask[base_sel] = True
-                new_mask[q_selected] = True
-                common = (base_mask & new_mask).float().sum().item()
-                change_rates.append(1.0 - common / max(1.0, float(min(base_sel.numel(), q_selected.numel()))))
-            selector_changed_frac = float(np.mean(change_rates)) if change_rates else 0.0
+            selector_changed_frac = selection_change_rate(base_selections, selections, batch_size, images.device)
         elif q_flags["gate"]:
             k = max(1, int(math.ceil(remember_rate * batch_size)))
             k = min(k, batch_size)
@@ -2890,7 +2945,6 @@ def train_epoch(
                 gate_pool_clean_rate = _tensor_mean_or_zero(clean_tensor_for_pool[pool_mask])
             gated_selections: List[torch.Tensor] = []
             base_in_gate_rates: List[float] = []
-            change_rates = []
             for m_idx in range(len(models)):
                 agg_loss = aggregate_losses(loss_stack, m_idx, active_mask_tensor, mode=args.aggregation).clone()
                 agg_loss[~pool_mask] = float("inf")
@@ -2898,15 +2952,9 @@ def train_epoch(
                 gated_selections.append(gated_sel)
                 base_sel = base_selections[m_idx]
                 base_in_gate_rates.append(float(pool_mask[base_sel].float().mean().item()) if base_sel.numel() else 0.0)
-                base_mask = torch.zeros(batch_size, device=images.device, dtype=torch.bool)
-                gated_mask = torch.zeros(batch_size, device=images.device, dtype=torch.bool)
-                base_mask[base_sel] = True
-                gated_mask[gated_sel] = True
-                common = (base_mask & gated_mask).float().sum().item()
-                change_rates.append(1.0 - common / max(1.0, float(min(base_sel.numel(), gated_sel.numel()))))
             selections = gated_selections
             base_selected_in_gate_rate = float(np.mean(base_in_gate_rates)) if base_in_gate_rates else 0.0
-            selector_changed_frac = float(np.mean(change_rates)) if change_rates else 0.0
+            selector_changed_frac = selection_change_rate(base_selections, selections, batch_size, images.device)
 
         current_overlap = selection_overlap(selections, batch_size, images.device, active_mask)
         batch_accumulator["overlap"].append(current_overlap)
