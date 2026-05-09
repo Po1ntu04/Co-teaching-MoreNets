@@ -255,6 +255,9 @@ if ($Mode -eq "gate" -and [Math]::Abs($QGatePoolMult - 1.25) -gt 0.000001) {
     $poolTag = ([string]::Format([System.Globalization.CultureInfo]::InvariantCulture, "{0:0.###}", $QGatePoolMult)) -replace "\.", "p"
     $runName = "${runName}_pool${poolTag}"
 }
+if ($DiagProcess) {
+    $runName = "${runName}_process"
+}
 if (-not $Session) {
     $Session = $runName
 }
