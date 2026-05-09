@@ -149,3 +149,25 @@ $$
   - `remote_results/q_isolation/qiso_gate_m3_seed2`
   - `remote_results/q_isolation/qiso_gate_m3_seed3`
 
+## 8. Gate Pool Width 边界检查
+
+在 seed 1 上进一步比较了 `q_gate_pool_mult=1.10/1.25/1.50/2.00`。
+
+| pool mult | best acc | last acc | last5 acc | q AUC | selected clean rate | overlap |
+|---:|---:|---:|---:|---:|---:|---:|
+| hard baseline | 79.73 | 79.61 | 79.320 | 0.9752 | 0.9322 | 0.9862 |
+| 1.10 | 79.84 | 79.84 | 79.360 | 0.9751 | 0.9325 | 0.9862 |
+| 1.25 | 80.03 | 80.01 | 79.472 | 0.9749 | 0.9323 | 0.9865 |
+| 1.50 | 80.03 | 79.66 | 79.418 | 0.9751 | 0.9326 | 0.9868 |
+| 2.00 | 79.73 | 79.61 | 79.320 | 0.9752 | 0.9322 | 0.9862 |
+
+解释：
+
+- `2.00` 在后期退化为 hard baseline，因为 remember rate 约为 `0.8`，`2*k` 超过 batch size 后候选池等于全 batch。
+- `1.10/1.50` 都没有明显降低 overlap，也没有显著提高 selected clean rate。
+- `1.25` 在 seed 1 上最好，但幅度小，不能过度解释为强参数最优。
+
+更新后的机制判断：
+
+> Q gate 可以稳定修复 continuous Q weighting 的 collapse，但 gate pool 宽度不是解决多模型趋同的主杠杆。overlap 高的根因更可能是 peer loss ranking 本身高度同质，下一步应改造 peer 差异来源，例如 staggered/asynchronous update、diversity-aware selection、不同时间尺度 teacher/student/critic 分工，而不是继续扫描 `q_gate_pool_mult`。
+
