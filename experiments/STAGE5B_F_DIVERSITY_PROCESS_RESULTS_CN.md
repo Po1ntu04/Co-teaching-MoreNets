@@ -119,7 +119,7 @@ Additional mean deltas:
 
 这说明当前最有价值的阶段性发现不是“Q gating 提升 accuracy”，也不是“Shapley utility 已经可用”，而是：
 
-> 在可靠 small-loss 边界内，多模型 teacher 的样本选择冗余是可测量瓶颈；弱 diversity penalty 能在不破坏可靠性的前提下降低冗余，并且该效应在 5-net 设置下更明显。
+> 在可靠 small-loss 边界内，多模型 teacher 的样本选择冗余是可测量瓶颈；弱 diversity penalty 能在较小可靠性代价下降低冗余，并且该效应在 5-net 设置下更明显。
 
 ## 阶段性失败与修正
 
@@ -134,7 +134,7 @@ Additional mean deltas:
 
 - reliability 决定 admissible candidate set。
 - diversity 在可靠候选集内降低多 teacher 冗余。
-- utility / Data Shapley 后续只能在 trusted, non-redundant candidates 内做二级 proposal，不能替代 reliability。
+- utility / Data Shapley 后续在当前证据下应优先作为 trusted, non-redundant candidates 内的二级 proposal；尚无数学或实验依据排除它未来作为 posterior evidence 的一部分，但不能在未验证 target construction 和误差传播前直接替代 reliability。
 
 ## 下一步建议
 
