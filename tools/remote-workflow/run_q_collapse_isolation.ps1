@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("smoke", "diagnostic", "prior", "selection", "weight")]
+    [ValidateSet("smoke", "diagnostic", "prior", "selection", "weight", "standard")]
     [string]$Mode = "smoke",
     [ValidateSet(2, 3, 5)]
     [int]$NumModels = 3,
@@ -163,12 +163,14 @@ function Get-QUsageMode {
     if ($Mode -eq "prior") { return "prior_only" }
     if ($Mode -eq "selection") { return "selection_only" }
     if ($Mode -eq "weight") { return "weight_only" }
+    if ($Mode -eq "standard") { return "standard" }
     throw "Unsupported mode: $Mode"
 }
 
 function Get-QMstepMode {
     param([string]$Mode)
     if ($Mode -eq "weight") { return "soft" }
+    if ($Mode -eq "standard") { return "robust" }
     return "hard"
 }
 
