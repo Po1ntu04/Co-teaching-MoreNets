@@ -307,6 +307,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="if >0, apply diversity-aware selection after q is computed inside the intersection of low-loss and top-q candidate pools",
     )
     parser.add_argument(
+        "--selection_diversity_min_base_votes",
+        type=int,
+        default=0,
+        help=(
+            "if >0, restrict diversity replacement candidates to samples selected by at least this many "
+            "models under the original low-loss selector when enough candidates exist"
+        ),
+    )
+    parser.add_argument(
+        "--selection_diversity_max_base_votes",
+        type=int,
+        default=-1,
+        help=(
+            "if >=0, restrict diversity replacement candidates to samples selected by at most this many "
+            "models under the original low-loss selector when enough candidates exist"
+        ),
+    )
+    parser.add_argument(
         "--selection_diversity_start_epoch",
         type=int,
         default=1,
@@ -730,6 +748,29 @@ def add_vote_metrics(
             record[f"{prefix}vote_clean_rate_{vote}"] = _tensor_mean_or_zero(clean_tensor[mask])
 
 
+def apply_base_vote_candidate_gate(
+    candidate_mask: torch.Tensor,
+    base_vote_counts: torch.Tensor,
+    min_votes: int,
+    max_votes: int,
+    required_k: int,
+) -> Tuple[torch.Tensor, float, float]:
+    gate = torch.ones_like(candidate_mask, dtype=torch.bool)
+    if min_votes > 0:
+        gate &= base_vote_counts >= float(min_votes)
+    if max_votes >= 0:
+        gate &= base_vote_counts <= float(max_votes)
+    if min_votes <= 0 and max_votes < 0:
+        return candidate_mask, 1.0, 0.0
+    constrained = candidate_mask & gate
+    base_count = float(candidate_mask.float().sum().item())
+    constrained_count = float(constrained.float().sum().item())
+    keep_frac = constrained_count / max(base_count, 1.0)
+    if constrained_count >= float(required_k):
+        return constrained, keep_frac, 1.0
+    return candidate_mask, keep_frac, 0.0
+
+
 def label_entropy_for_mask(labels: torch.Tensor, mask: torch.Tensor, num_classes: int) -> float:
     if mask.numel() == 0 or not bool(mask.any().item()):
         return 0.0
@@ -870,6 +911,8 @@ def summarize_process_records(records: List[Dict[str, float]], bins: int) -> Dic
         "loss_rank_corr_",
         "grad_cos_",
         "update_cos_",
+        "diversity_",
+        "selection_diversity_",
     )
     for record in records:
         for key in record.keys():
@@ -2999,7 +3042,10 @@ def train_epoch(
             selected = torch.topk(agg_loss, k, largest=False).indices
             selections.append(selected)
         base_selections = [sel.detach().clone() for sel in selections]
+        base_vote_counts_for_diversity = selection_counts_for(base_selections, batch_size, images.device, active_mask)
         selection_diversity_effective_strength = 0.0
+        diversity_base_vote_gate_keep_fracs: List[float] = []
+        diversity_base_vote_gate_applied: List[float] = []
         if args.selection_diversity_strength > 0 and epoch >= args.selection_diversity_start_epoch:
             selection_diversity_effective_strength = float(args.selection_diversity_strength)
             if args.selection_diversity_ramp_epochs > 0:
@@ -3028,6 +3074,15 @@ def train_epoch(
                 candidate_idx = torch.topk(agg_loss, pool_k, largest=False).indices
                 candidate_mask = torch.zeros(batch_size, device=images.device, dtype=torch.bool)
                 candidate_mask[candidate_idx] = True
+                candidate_mask, keep_frac, gate_applied = apply_base_vote_candidate_gate(
+                    candidate_mask,
+                    base_vote_counts_for_diversity,
+                    int(args.selection_diversity_min_base_votes),
+                    int(args.selection_diversity_max_base_votes),
+                    k,
+                )
+                diversity_base_vote_gate_keep_fracs.append(keep_frac)
+                diversity_base_vote_gate_applied.append(gate_applied)
                 loss_scale = agg_loss.detach().float().std(unbiased=False).clamp_min(1e-6)
                 score = agg_loss + selection_diversity_effective_strength * loss_scale * selected_counts
                 score = score.clone()
@@ -3167,6 +3222,15 @@ def train_epoch(
                 candidate_mask = low_pool_mask & q_pool_mask
                 if int(candidate_mask.sum().item()) < k:
                     candidate_mask = low_pool_mask
+                candidate_mask, keep_frac, gate_applied = apply_base_vote_candidate_gate(
+                    candidate_mask,
+                    base_vote_counts_for_diversity,
+                    int(args.selection_diversity_min_base_votes),
+                    int(args.selection_diversity_max_base_votes),
+                    k,
+                )
+                diversity_base_vote_gate_keep_fracs.append(keep_frac)
+                diversity_base_vote_gate_applied.append(gate_applied)
                 loss_scale = agg_loss.detach().float().std(unbiased=False).clamp_min(1e-6)
                 score = agg_loss + selection_diversity_effective_strength * loss_scale * selected_counts
                 score = score.clone()
@@ -3295,6 +3359,18 @@ def train_epoch(
                 "overlap": float(current_overlap),
                 "selector_changed_frac": float(selector_changed_frac),
                 "selection_diversity_effective_strength": float(selection_diversity_effective_strength),
+                "selection_diversity_min_base_votes": float(args.selection_diversity_min_base_votes),
+                "selection_diversity_max_base_votes": float(args.selection_diversity_max_base_votes),
+                "diversity_base_vote_gate_keep_frac": float(
+                    np.mean(diversity_base_vote_gate_keep_fracs)
+                    if diversity_base_vote_gate_keep_fracs
+                    else 1.0
+                ),
+                "diversity_base_vote_gate_applied_rate": float(
+                    np.mean(diversity_base_vote_gate_applied)
+                    if diversity_base_vote_gate_applied
+                    else 0.0
+                ),
                 "base_selected_in_gate_rate": float(base_selected_in_gate_rate),
                 "selected_any_frac": float(selected_any.float().mean().item()),
                 "selected_all_frac": float(selected_all.float().mean().item()),
