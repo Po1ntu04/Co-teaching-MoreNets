@@ -301,6 +301,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="candidate-pool multiplier for diversity-aware low-loss selection",
     )
     parser.add_argument(
+        "--selection_diversity_q_gate_mult",
+        type=float,
+        default=0.0,
+        help="if >0, apply diversity-aware selection after q is computed inside the intersection of low-loss and top-q candidate pools",
+    )
+    parser.add_argument(
         "--selection_diversity_start_epoch",
         type=int,
         default=1,
@@ -2801,7 +2807,11 @@ def train_epoch(
             selections.append(selected)
         base_selections = [sel.detach().clone() for sel in selections]
         pre_q_selector_changed_frac = 0.0
-        if args.selection_diversity_strength > 0 and epoch >= args.selection_diversity_start_epoch:
+        if (
+            args.selection_diversity_strength > 0
+            and args.selection_diversity_q_gate_mult <= 0
+            and epoch >= args.selection_diversity_start_epoch
+        ):
             diversity_selections: List[Optional[torch.Tensor]] = [None for _ in range(len(models))]
             selected_counts = torch.zeros(batch_size, device=images.device, dtype=torch.float32)
             model_order = list(range(len(models)))
@@ -2923,7 +2933,56 @@ def train_epoch(
         gate_pool_q_mean = 0.0
         selector_changed_frac = float(pre_q_selector_changed_frac)
         base_selected_in_gate_rate = 0.0
-        if q_flags["selection"]:
+        if (
+            args.selection_diversity_strength > 0
+            and args.selection_diversity_q_gate_mult > 0
+            and epoch >= args.selection_diversity_start_epoch
+        ):
+            k = max(1, int(math.ceil(remember_rate * batch_size)))
+            k = min(k, batch_size)
+            q_gate_mult = max(1.0, float(args.selection_diversity_q_gate_mult))
+            q_pool_k = min(batch_size, max(k, int(math.ceil(q_gate_mult * k))))
+            q_pool = torch.topk(Q_i, q_pool_k, largest=True).indices
+            q_pool_mask = torch.zeros(batch_size, device=images.device, dtype=torch.bool)
+            q_pool_mask[q_pool] = True
+            gate_pool_frac = float(q_pool_mask.float().mean().item())
+            gate_pool_q_mean = _tensor_mean_or_zero(Q_i[q_pool_mask])
+            if clean_np is not None:
+                clean_tensor_for_pool = torch.tensor(clean_np, device=images.device, dtype=torch.float32)
+                gate_pool_clean_rate = _tensor_mean_or_zero(clean_tensor_for_pool[q_pool_mask])
+            base_in_gate_rates = []
+            diversity_selections = [None for _ in range(len(models))]
+            selected_counts = torch.zeros(batch_size, device=images.device, dtype=torch.float32)
+            model_order = list(range(len(models)))
+            if model_order:
+                shift = (epoch + batch_idx) % len(model_order)
+                model_order = model_order[shift:] + model_order[:shift]
+            for m_idx in model_order:
+                agg_loss = aggregate_losses(loss_stack, m_idx, active_mask_tensor, mode=args.aggregation)
+                pool_mult = max(1.0, float(args.selection_diversity_pool_mult))
+                low_pool_k = min(batch_size, max(k, int(math.ceil(pool_mult * k))))
+                low_pool = torch.topk(agg_loss, low_pool_k, largest=False).indices
+                low_pool_mask = torch.zeros(batch_size, device=images.device, dtype=torch.bool)
+                low_pool_mask[low_pool] = True
+                candidate_mask = low_pool_mask & q_pool_mask
+                if int(candidate_mask.sum().item()) < k:
+                    candidate_mask = low_pool_mask
+                loss_scale = agg_loss.detach().float().std(unbiased=False).clamp_min(1e-6)
+                score = agg_loss + float(args.selection_diversity_strength) * loss_scale * selected_counts
+                score = score.clone()
+                score[~candidate_mask] = float("inf")
+                selected = torch.topk(score, k, largest=False).indices
+                diversity_selections[m_idx] = selected
+                selected_counts[selected] += 1.0
+                base_sel = base_selections[m_idx]
+                base_in_gate_rates.append(float(q_pool_mask[base_sel].float().mean().item()) if base_sel.numel() else 0.0)
+            selections = [
+                sel if sel is not None else base_selections[m_idx]
+                for m_idx, sel in enumerate(diversity_selections)
+            ]
+            base_selected_in_gate_rate = float(np.mean(base_in_gate_rates)) if base_in_gate_rates else 0.0
+            selector_changed_frac = selection_change_rate(base_selections, selections, batch_size, images.device)
+        elif q_flags["selection"]:
             k = max(1, int(math.ceil(remember_rate * batch_size)))
             k = min(k, batch_size)
             q_selected = torch.topk(Q_i, k, largest=True).indices
