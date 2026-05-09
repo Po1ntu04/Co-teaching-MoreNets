@@ -186,6 +186,13 @@ function Get-QCommand {
         $epochs = 3
         $iters = 20
     }
+    $batchSize = 512
+    if ($NumModels -eq 3) {
+        $batchSize = 256
+    }
+    elseif ($NumModels -ge 5) {
+        $batchSize = 128
+    }
     $qUsage = Get-QUsageMode -Mode $Mode
     $mstep = Get-QMstepMode -Mode $Mode
     $parts = @(
@@ -194,7 +201,7 @@ function Get-QCommand {
         "--num_models $NumModels --q_mode hybrid --q_usage_mode $qUsage --mstep_mode $mstep",
         "--sam_rho 0 --replay_size 0 --replay_ratio 0",
         "--lambda_mode accuracy --lambda_patience 9999 --min_active 2",
-        "--batch_size 512 --num_workers 8 --prefetch_factor 4 --drop_last",
+        "--batch_size $batchSize --num_workers 8 --prefetch_factor 4 --drop_last",
         "--n_epoch $epochs --num_iter_per_epoch $iters --num_gradual 10 --epoch_decay_start 80",
         "--val_split 0.1 --seed $Seed",
         "--result_dir results_diag/q_isolation/$RunName"

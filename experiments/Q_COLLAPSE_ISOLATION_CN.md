@@ -84,7 +84,7 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=$DEV python -u main.py \
 --sam_rho 0
 --replay_size 0 --replay_ratio 0
 --lambda_mode accuracy --lambda_patience 9999
---batch_size 512 --num_workers 8 --prefetch_factor 4 --drop_last
+--batch_size <按模型数选择> --num_workers 8 --prefetch_factor 4 --drop_last
 --n_epoch 30 --num_iter_per_epoch 100
 ```
 
@@ -142,7 +142,7 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=$DEV python -u main.py \
 
 先不全量跑完整矩阵。按信息增益排序：
 
-1. smoke：3 models, diagnostic-only, 3 epochs。
+1. smoke：3 models, diagnostic-only, 3 epochs，batch 256。
 2. B1：2/3 models diagnostic-only，seed1。
 3. B2：2/3 models prior-only，seed1。
 4. B3：2/3 models selection-only，seed1。
@@ -155,3 +155,15 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=$DEV python -u main.py \
 - 如果 diagnostic-only 健康而 prior/weight/selection 崩，说明 Q 本身和 Q 用法要分开。
 - 如果 3 models 比 2 models 更坏，必须结合 overlap/disagreement 判断是否同步错误共识。
 - 如果 5 models 更差，不等于多模型失败，可能只是同构同步投票冗余。
+
+## 7. Batch 默认值
+
+Q isolation 会同时持有多个模型的 forward graph，显存随模型数近似线性增长。当前远端 smoke 已验证 3 models + batch 512 会在 4090 上 OOM，因此默认值调整为：
+
+| 模型数 | 4090/3090 batch |
+|---:|---:|
+| 2 | 512 |
+| 3 | 256 |
+| 5 | 128 |
+
+如果后续加入诊断 oracle 或 target construction，应优先再降一档，而不是用 OOM 后的结果判断算法失败。
