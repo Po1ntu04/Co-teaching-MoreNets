@@ -8,6 +8,7 @@ param(
     [string]$Session = "",
     [int]$Gpu = -1,
     [switch]$SkipGitSync,
+    [switch]$SkipRemoteGitSync,
     [switch]$NoWait,
     [switch]$FetchResults
 )
@@ -240,11 +241,16 @@ SESSION="$(decode_arg "$6")"
 LOG_FILE="$(decode_arg "$7")"
 RUN_CMD="$(decode_arg "$8")"
 RESULT_ROOT="$(decode_arg "$9")"
+SKIP_REMOTE_GIT="$(decode_arg "${10}")"
 
 cd "$REPO_DIR"
-git fetch "$GIT_REMOTE"
-git checkout "$BRANCH"
-git pull --ff-only "$GIT_REMOTE" "$BRANCH"
+if [ "$SKIP_REMOTE_GIT" != "1" ]; then
+    git fetch "$GIT_REMOTE"
+    git checkout "$BRANCH"
+    git pull --ff-only "$GIT_REMOTE" "$BRANCH"
+else
+    git checkout "$BRANCH"
+fi
 
 mkdir -p "$(dirname "$LOG_FILE")"
 if tmux has-session -t "$SESSION" 2>/dev/null; then
@@ -279,7 +285,8 @@ Invoke-QIsolationRemoteScript -Config $config -Target $target -Script $remoteScr
     $Session,
     $logFile,
     $runCmd,
-    "results_diag/q_isolation/$runName"
+    "results_diag/q_isolation/$runName",
+    $(if ($SkipRemoteGitSync) { "1" } else { "0" })
 )
 
 Write-Host "Started Q isolation $Mode m=$NumModels seed=$Seed on GPU $Gpu."
