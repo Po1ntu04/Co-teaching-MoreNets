@@ -144,6 +144,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=1.25,
         help="candidate-pool multiplier for q_usage_mode=gate_selection",
     )
+    parser.add_argument(
+        "--diag_process",
+        action="store_true",
+        help="record within-epoch process dynamics: q, selection, overlap, and update-scale trajectories",
+    )
+    parser.add_argument(
+        "--diag_process_bins",
+        type=int,
+        default=5,
+        help="number of within-epoch bins for process dynamics summaries",
+    )
+    parser.add_argument(
+        "--diag_process_grad_every",
+        type=int,
+        default=10,
+        help="record exact parameter-update norms every N train batches when --diag_process is enabled",
+    )
+    parser.add_argument(
+        "--diag_process_output_dir",
+        type=str,
+        default="",
+        help="directory for process dynamics JSONL; defaults to result_dir/process_diagnostics",
+    )
     # ------------------------------------------------------------------------
     # Prior / pi_t update (slow variable for streaming)
     parser.add_argument("--pi_init", type=float, default=0.8, help="initial clean prior pi")
@@ -555,6 +578,98 @@ def clean_mask_for_indices(base_dataset, indices_np: np.ndarray) -> Optional[np.
     return clean
 
 
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        value_f = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value_f):
+        return default
+    return value_f
+
+
+def _mean_or_zero(values: Sequence[float]) -> float:
+    clean_values = [_safe_float(v, default=float("nan")) for v in values]
+    clean_values = [v for v in clean_values if math.isfinite(v)]
+    return float(np.mean(clean_values)) if clean_values else 0.0
+
+
+def _tensor_mean_or_zero(values: torch.Tensor) -> float:
+    if values.numel() == 0:
+        return 0.0
+    return float(values.detach().float().mean().item())
+
+
+def parameter_norm(model: torch.nn.Module) -> float:
+    total = 0.0
+    with torch.no_grad():
+        for param in model.parameters():
+            total += float(param.detach().float().pow(2).sum().item())
+    return math.sqrt(max(total, 0.0))
+
+
+def gradient_norm(model: torch.nn.Module) -> float:
+    total = 0.0
+    for param in model.parameters():
+        if param.grad is None:
+            continue
+        total += float(param.grad.detach().float().pow(2).sum().item())
+    return math.sqrt(max(total, 0.0))
+
+
+def capture_parameters(model: torch.nn.Module) -> List[torch.Tensor]:
+    return [param.detach().clone() for param in model.parameters()]
+
+
+def update_norm_from_snapshot(model: torch.nn.Module, before: Sequence[torch.Tensor]) -> float:
+    total = 0.0
+    with torch.no_grad():
+        for param, old_param in zip(model.parameters(), before):
+            total += float((param.detach() - old_param).float().pow(2).sum().item())
+    return math.sqrt(max(total, 0.0))
+
+
+def summarize_process_records(records: List[Dict[str, float]], bins: int) -> Dict[str, object]:
+    if not records:
+        return {}
+    bins = max(1, int(bins))
+    keys = [
+        "q_mean",
+        "q_std",
+        "q_entropy",
+        "q_clean_auc",
+        "selected_clean_rate",
+        "overlap",
+        "selected_q_mean",
+        "unselected_q_mean",
+        "selected_loss_mean",
+        "unselected_loss_mean",
+        "gate_pool_frac",
+        "gate_pool_clean_rate",
+        "grad_norm_mean",
+        "update_norm_mean",
+        "update_to_param_mean",
+    ]
+    summary: Dict[str, object] = {"num_batches": len(records), "bins": bins}
+    for key in keys:
+        values = [_safe_float(record.get(key), default=float("nan")) for record in records]
+        values = [v for v in values if math.isfinite(v)]
+        if not values:
+            continue
+        summary[f"{key}_mean"] = float(np.mean(values))
+        summary[f"{key}_first"] = float(values[0])
+        summary[f"{key}_last"] = float(values[-1])
+        summary[f"{key}_delta"] = float(values[-1] - values[0])
+        bin_values: List[float] = []
+        for bin_idx in range(bins):
+            start = int(math.floor(bin_idx * len(values) / bins))
+            end = int(math.floor((bin_idx + 1) * len(values) / bins))
+            segment = values[start:end]
+            bin_values.append(float(np.mean(segment)) if segment else float("nan"))
+        summary[f"{key}_bins"] = bin_values
+    return summary
+
+
 def q_usage_flags(args) -> Dict[str, bool]:
     mode = getattr(args, "q_usage_mode", "standard")
     return {
@@ -615,6 +730,7 @@ def sam_update(
     optimizer: torch.optim.Optimizer,
     loss_builder,
     rho: float,
+    collect_process_stats: bool = False,
 ) -> Tuple[float, float]:
     """
     Two-step SAM update on a dynamically rebuilt loss.
@@ -623,13 +739,20 @@ def sam_update(
     optimizer.zero_grad()
     clean_loss = loss_builder()
     clean_loss.backward()
-    grad_parts = [p.grad.view(-1) for p in model.parameters() if p.grad is not None]
-    if not grad_parts:
+    grad_norm_value = gradient_norm(model)
+    if grad_norm_value <= 0.0:
         optimizer.zero_grad()
+        optimizer._last_process_stats = {
+            "grad_norm": 0.0,
+            "update_norm": 0.0,
+            "param_norm": parameter_norm(model) if collect_process_stats else 0.0,
+            "sam_perturb_norm": 0.0,
+        }
         return clean_loss.item(), clean_loss.item()
-    grad_norm = torch.norm(torch.cat(grad_parts), p=2)
+    grad_norm = torch.tensor(grad_norm_value, device=next(model.parameters()).device)
     scale = rho / (grad_norm + 1e-12)
     e_ws: List[torch.Tensor] = []
+    perturb_sq = 0.0
     with torch.no_grad():
         for p in model.parameters():
             if p.grad is None:
@@ -638,6 +761,7 @@ def sam_update(
             e_w = p.grad * scale
             p.add_(e_w)
             e_ws.append(e_w)
+            perturb_sq += float(e_w.detach().float().pow(2).sum().item())
     optimizer.zero_grad()
     perturbed_loss = loss_builder()
     perturbed_loss.backward()
@@ -646,18 +770,39 @@ def sam_update(
             if e_w is None:
                 continue
             p.sub_(e_w)
+    before_params = capture_parameters(model) if collect_process_stats else None
+    param_norm_value = parameter_norm(model) if collect_process_stats else 0.0
     optimizer.step()
+    update_norm_value = update_norm_from_snapshot(model, before_params) if before_params is not None else 0.0
+    optimizer._last_process_stats = {
+        "grad_norm": float(grad_norm_value),
+        "update_norm": float(update_norm_value),
+        "param_norm": float(param_norm_value),
+        "sam_perturb_norm": math.sqrt(max(perturb_sq, 0.0)),
+    }
     return clean_loss.item(), perturbed_loss.item()
 
 
 def standard_update(
     optimizer: torch.optim.Optimizer,
     loss_builder,
+    model: Optional[torch.nn.Module] = None,
+    collect_process_stats: bool = False,
 ) -> Tuple[float, float]:
     optimizer.zero_grad()
     loss = loss_builder()
     loss.backward()
+    grad_norm_value = gradient_norm(model) if model is not None else 0.0
+    before_params = capture_parameters(model) if (collect_process_stats and model is not None) else None
+    param_norm_value = parameter_norm(model) if (collect_process_stats and model is not None) else 0.0
     optimizer.step()
+    update_norm_value = update_norm_from_snapshot(model, before_params) if (before_params is not None and model is not None) else 0.0
+    optimizer._last_process_stats = {
+        "grad_norm": float(grad_norm_value),
+        "update_norm": float(update_norm_value),
+        "param_norm": float(param_norm_value),
+        "sam_perturb_norm": 0.0,
+    }
     loss_value = loss.item()
     return loss_value, loss_value
 
@@ -2546,7 +2691,11 @@ def train_epoch(
         "q_clean_auc": [],
         "selected_clean_rate": [],
         "overlap": [],
+        "grad_norm": [],
+        "update_norm": [],
+        "update_to_param": [],
     }
+    process_records: List[Dict[str, float]] = []
     num_batches = 0
 
     for batch_idx, (images, labels, indices) in enumerate(loader):
@@ -2702,6 +2851,9 @@ def train_epoch(
         else:
             Q_i = q_batch.detach()
 
+        gate_pool_frac = 0.0
+        gate_pool_clean_rate = 0.0
+        gate_pool_q_mean = 0.0
         if q_flags["selection"]:
             k = max(1, int(math.ceil(remember_rate * batch_size)))
             k = min(k, batch_size)
@@ -2716,6 +2868,11 @@ def train_epoch(
             q_pool = torch.topk(Q_i, pool_k, largest=True).indices
             pool_mask = torch.zeros(batch_size, device=images.device, dtype=torch.bool)
             pool_mask[q_pool] = True
+            gate_pool_frac = float(pool_mask.float().mean().item())
+            gate_pool_q_mean = _tensor_mean_or_zero(Q_i[pool_mask])
+            if clean_np is not None:
+                clean_tensor_for_pool = torch.tensor(clean_np, device=images.device, dtype=torch.float32)
+                gate_pool_clean_rate = _tensor_mean_or_zero(clean_tensor_for_pool[pool_mask])
             gated_selections: List[torch.Tensor] = []
             for m_idx in range(len(models)):
                 agg_loss = aggregate_losses(loss_stack, m_idx, active_mask_tensor, mode=args.aggregation).clone()
@@ -2734,15 +2891,19 @@ def train_epoch(
         batch_accumulator["q_min"].append(q_batch.min().item())
         batch_accumulator["q_max"].append(q_batch.max().item())
         batch_accumulator["q_entropy"].append(q_entropy.mean().item())
+        batch_q_auc = float("nan")
+        batch_selected_clean_rate = float("nan")
         if clean_np is not None:
-            batch_accumulator["q_clean_auc"].append(binary_auc(q_cpu, clean_np))
+            batch_q_auc = binary_auc(q_cpu, clean_np)
+            batch_accumulator["q_clean_auc"].append(batch_q_auc)
             selected_rates: List[float] = []
             clean_tensor = torch.tensor(clean_np, device=images.device, dtype=torch.float32)
             for sel in selections:
                 if sel.numel() > 0:
                     selected_rates.append(float(clean_tensor[sel].mean().item()))
             if selected_rates:
-                batch_accumulator["selected_clean_rate"].append(float(np.mean(selected_rates)))
+                batch_selected_clean_rate = float(np.mean(selected_rates))
+                batch_accumulator["selected_clean_rate"].append(batch_selected_clean_rate)
 
         if q_flags["prior"]:
             sum_q = float(Q_i.sum().item())
@@ -2770,6 +2931,54 @@ def train_epoch(
                         replay_buffer[replace_pos] = int(i)
                         replay_set.add(int(i))
 
+        batch_process_record: Optional[Dict[str, float]] = None
+        selection_counts = torch.zeros(batch_size, device=images.device, dtype=torch.float32)
+        for sel in selections:
+            if sel.numel() > 0:
+                selection_counts[sel] += 1.0
+        selected_any = selection_counts > 0
+        selected_all = selection_counts >= max(1, len(models))
+        unselected_any = ~selected_any
+        if args.diag_process:
+            batch_process_record = {
+                "epoch": float(epoch),
+                "batch_idx": float(batch_idx),
+                "remember_rate": float(remember_rate),
+                "batch_size": float(batch_size),
+                "online_batch_size": float(online_batch_size),
+                "replay_count": float(replay_count),
+                "q_mean": float(q_batch.mean().item()),
+                "q_std": float(q_batch.std(unbiased=False).item()),
+                "q_min": float(q_batch.min().item()),
+                "q_max": float(q_batch.max().item()),
+                "q_entropy": float(q_entropy.mean().item()),
+                "q_clean_auc": _safe_float(batch_q_auc, default=0.0),
+                "selected_clean_rate": _safe_float(batch_selected_clean_rate, default=0.0),
+                "overlap": float(current_overlap),
+                "selected_any_frac": float(selected_any.float().mean().item()),
+                "selected_all_frac": float(selected_all.float().mean().item()),
+                "selected_vote_mean": float(selection_counts.mean().item()),
+                "selected_q_mean": _tensor_mean_or_zero(Q_i[selected_any]),
+                "unselected_q_mean": _tensor_mean_or_zero(Q_i[unselected_any]),
+                "selected_loss_mean": _tensor_mean_or_zero(agg_loss_all[selected_any]),
+                "unselected_loss_mean": _tensor_mean_or_zero(agg_loss_all[unselected_any]),
+                "gate_pool_frac": float(gate_pool_frac),
+                "gate_pool_clean_rate": float(gate_pool_clean_rate),
+                "gate_pool_q_mean": float(gate_pool_q_mean),
+            }
+            if clean_np is not None:
+                clean_tensor_process = torch.tensor(clean_np, device=images.device, dtype=torch.float32)
+                batch_process_record["selected_any_clean_rate"] = _tensor_mean_or_zero(clean_tensor_process[selected_any])
+                batch_process_record["unselected_any_clean_rate"] = _tensor_mean_or_zero(clean_tensor_process[unselected_any])
+
+        collect_process_stats = (
+            bool(args.diag_process)
+            and int(args.diag_process_grad_every) > 0
+            and (batch_idx % int(args.diag_process_grad_every) == 0)
+        )
+        model_grad_norms: List[float] = []
+        model_update_norms: List[float] = []
+        model_update_ratios: List[float] = []
         for m_idx, (model, optimizer) in enumerate(zip(models, optimizers)):
             sel = selections[m_idx]
             if sel.numel() == 0:
@@ -2795,6 +3004,7 @@ def train_epoch(
                     args,
                 )
 
+            optimizer._last_process_stats = {}
             if args.utility_mode == "sam_gap" and args.sam_rho > 0 and args.mstep_mode == "hard":
                 clean_loss, perturbed_loss, utility_mean, utility_std, utility_gap_mean = sam_gap_weighted_update(
                     model,
@@ -2846,13 +3056,43 @@ def train_epoch(
                     optimizer,
                     loss_builder,
                     rho=args.sam_rho,
+                    collect_process_stats=collect_process_stats,
                 )
             else:
-                clean_loss, perturbed_loss = standard_update(optimizer, loss_builder)
+                clean_loss, perturbed_loss = standard_update(
+                    optimizer,
+                    loss_builder,
+                    model=model,
+                    collect_process_stats=collect_process_stats,
+                )
             batch_accumulator["clean_loss"][m_idx] += clean_loss
             batch_accumulator["sharp_loss"][m_idx] += perturbed_loss
             batch_accumulator["sharp_gap"][m_idx] += max(0.0, perturbed_loss - clean_loss)
+            process_stats = getattr(optimizer, "_last_process_stats", {})
+            if process_stats:
+                grad_norm_value = _safe_float(process_stats.get("grad_norm"), default=0.0)
+                update_norm_value = _safe_float(process_stats.get("update_norm"), default=0.0)
+                param_norm_value = _safe_float(process_stats.get("param_norm"), default=0.0)
+                model_grad_norms.append(grad_norm_value)
+                if update_norm_value > 0.0:
+                    model_update_norms.append(update_norm_value)
+                if update_norm_value > 0.0 and param_norm_value > 0.0:
+                    model_update_ratios.append(update_norm_value / max(param_norm_value, 1e-12))
             update_ema_model(model, teacher_models[m_idx], args.teacher_ema)
+
+        if model_grad_norms:
+            batch_accumulator["grad_norm"].append(float(np.mean(model_grad_norms)))
+        if model_update_norms:
+            batch_accumulator["update_norm"].append(float(np.mean(model_update_norms)))
+        if model_update_ratios:
+            batch_accumulator["update_to_param"].append(float(np.mean(model_update_ratios)))
+        if batch_process_record is not None:
+            batch_process_record["grad_norm_mean"] = float(np.mean(model_grad_norms)) if model_grad_norms else 0.0
+            batch_process_record["update_norm_mean"] = float(np.mean(model_update_norms)) if model_update_norms else 0.0
+            batch_process_record["update_to_param_mean"] = (
+                float(np.mean(model_update_ratios)) if model_update_ratios else 0.0
+            )
+            process_records.append(batch_process_record)
 
         teacher_pred = teacher_committee_probs.argmax(dim=1)
         for idx, probs in enumerate(student_probs_list):
@@ -2908,6 +3148,33 @@ def train_epoch(
     selected_clean_values = [v for v in batch_accumulator["selected_clean_rate"] if np.isfinite(v)]
     metrics["selected_clean_rate"] = float(np.mean(selected_clean_values)) if selected_clean_values else 0.0
     metrics["overlap"] = float(np.mean(batch_accumulator["overlap"])) if batch_accumulator["overlap"] else 0.0
+    metrics["grad_norm"] = _mean_or_zero(batch_accumulator["grad_norm"])
+    metrics["update_norm"] = _mean_or_zero(batch_accumulator["update_norm"])
+    metrics["update_to_param"] = _mean_or_zero(batch_accumulator["update_to_param"])
+    if args.diag_process and process_records:
+        process_summary = summarize_process_records(process_records, args.diag_process_bins)
+        metrics["process_summary"] = process_summary
+        process_dir = args.diag_process_output_dir.strip() if args.diag_process_output_dir else ""
+        if not process_dir:
+            process_dir = os.path.join(args.result_dir, "process_diagnostics")
+        ensure_dir(process_dir)
+        process_file = os.path.join(process_dir, "process_dynamics.jsonl")
+        with open(process_file, "a") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "epoch": epoch,
+                        "q_usage_mode": getattr(args, "q_usage_mode", "standard"),
+                        "q_mode": args.q_mode,
+                        "mstep_mode": args.mstep_mode,
+                        "remember_rate": remember_rate,
+                        "summary": process_summary,
+                        "batches": process_records,
+                    }
+                )
+                + "\n"
+            )
+        metrics["process_file"] = process_file
 
     if args.q_mode == "bmm" and epoch_losses:
         all_losses = np.concatenate(epoch_losses)
@@ -3252,6 +3519,11 @@ def main():
             "q_clean_auc": train_metrics.get("q_clean_auc", 0.0),
             "selected_clean_rate": train_metrics.get("selected_clean_rate", 0.0),
             "overlap": train_metrics['overlap'],
+            "grad_norm": train_metrics.get("grad_norm", 0.0),
+            "update_norm": train_metrics.get("update_norm", 0.0),
+            "update_to_param": train_metrics.get("update_to_param", 0.0),
+            "process_summary": train_metrics.get("process_summary", {}),
+            "process_file": train_metrics.get("process_file", ""),
             "pi_t": pi_t,
             "active_models": sum(active_mask),
             "replay_size": replay_size_for_log,

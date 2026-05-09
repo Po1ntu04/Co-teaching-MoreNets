@@ -8,6 +8,9 @@ param(
     [string]$Session = "",
     [int]$Gpu = -1,
     [double]$QGatePoolMult = 1.25,
+    [switch]$DiagProcess,
+    [int]$DiagProcessBins = 5,
+    [int]$DiagProcessGradEvery = 10,
     [switch]$SkipGitSync,
     [switch]$SkipRemoteGitSync,
     [switch]$NoWait,
@@ -29,6 +32,7 @@ function Invoke-QIsolationSelectiveGitSync {
         "experiments/RELIABILITY_UTILITY_RESEARCH_PROGRAM_CN.md",
         "experiments/Q_COLLAPSE_ISOLATION_CN.md",
         "scripts/analyze_q_collapse.py",
+        "scripts/analyze_process_dynamics.py",
         "tools/remote-workflow/run_q_collapse_isolation.ps1"
     )
     foreach ($file in $files) {
@@ -183,7 +187,10 @@ function Get-QCommand {
         [int]$Seed,
         [int]$Gpu,
         [string]$RunName,
-        [double]$QGatePoolMult
+        [double]$QGatePoolMult,
+        [bool]$DiagProcess,
+        [int]$DiagProcessBins,
+        [int]$DiagProcessGradEvery
     )
     $epochs = 30
     $iters = 100
@@ -215,6 +222,10 @@ function Get-QCommand {
         $poolMultText = [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, "{0:0.###}", $QGatePoolMult)
         $parts += "--q_gate_pool_mult $poolMultText"
     }
+    if ($DiagProcess) {
+        $parts += "--diag_process --diag_process_bins $DiagProcessBins --diag_process_grad_every $DiagProcessGradEvery"
+        $parts += "--diag_process_output_dir results_diag/q_isolation/$RunName/process_diagnostics"
+    }
     return ($parts -join " ")
 }
 
@@ -225,7 +236,7 @@ if (-not $Branch) {
     $Branch = Get-CurrentBranch
 }
 
-& python -m py_compile main.py model.py scripts/analyze_q_collapse.py
+& python -m py_compile main.py model.py scripts/analyze_q_collapse.py scripts/analyze_process_dynamics.py
 if ($LASTEXITCODE -ne 0) {
     throw "Local py_compile failed."
 }
@@ -248,7 +259,7 @@ if (-not $Session) {
     $Session = $runName
 }
 $logFile = "logs/q_isolation/$Session.log"
-$runCmd = Get-QCommand -Mode $Mode -NumModels $NumModels -Seed $Seed -Gpu $Gpu -RunName $runName -QGatePoolMult $QGatePoolMult
+$runCmd = Get-QCommand -Mode $Mode -NumModels $NumModels -Seed $Seed -Gpu $Gpu -RunName $runName -QGatePoolMult $QGatePoolMult -DiagProcess ([bool]$DiagProcess) -DiagProcessBins $DiagProcessBins -DiagProcessGradEvery $DiagProcessGradEvery
 
 $remoteScript = @'
 set -euo pipefail
@@ -289,6 +300,7 @@ RUNNER="$REPO_DIR/.workflow_${SESSION}.sh"
     printf 'echo %q\n' "$RUN_CMD"
     echo "$RUN_CMD"
     echo "python scripts/analyze_q_collapse.py \"$RESULT_ROOT\" --out \"$RESULT_ROOT/${SESSION}_summary.csv\""
+    echo "python scripts/analyze_process_dynamics.py \"$RESULT_ROOT\" --out \"$RESULT_ROOT/${SESSION}_process_summary.csv\""
 } > "$RUNNER"
 chmod +x "$RUNNER"
 tmux new-session -d -s "$SESSION" "bash '$RUNNER' > '$LOG_FILE' 2>&1"
