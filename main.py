@@ -325,6 +325,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--selection_diversity_zero_vote_penalty",
+        type=float,
+        default=0.0,
+        help=(
+            "soft penalty, in loss-std units, added to diversity candidates that received zero votes "
+            "under the original low-loss selector"
+        ),
+    )
+    parser.add_argument(
         "--selection_diversity_start_epoch",
         type=int,
         default=1,
@@ -3085,6 +3094,10 @@ def train_epoch(
                 diversity_base_vote_gate_applied.append(gate_applied)
                 loss_scale = agg_loss.detach().float().std(unbiased=False).clamp_min(1e-6)
                 score = agg_loss + selection_diversity_effective_strength * loss_scale * selected_counts
+                if args.selection_diversity_zero_vote_penalty > 0:
+                    score = score + float(args.selection_diversity_zero_vote_penalty) * loss_scale * (
+                        base_vote_counts_for_diversity <= 0
+                    ).float()
                 score = score.clone()
                 score[~candidate_mask] = float("inf")
                 selected = torch.topk(score, k, largest=False).indices
@@ -3233,6 +3246,10 @@ def train_epoch(
                 diversity_base_vote_gate_applied.append(gate_applied)
                 loss_scale = agg_loss.detach().float().std(unbiased=False).clamp_min(1e-6)
                 score = agg_loss + selection_diversity_effective_strength * loss_scale * selected_counts
+                if args.selection_diversity_zero_vote_penalty > 0:
+                    score = score + float(args.selection_diversity_zero_vote_penalty) * loss_scale * (
+                        base_vote_counts_for_diversity <= 0
+                    ).float()
                 score = score.clone()
                 score[~candidate_mask] = float("inf")
                 selected = torch.topk(score, k, largest=False).indices
@@ -3361,6 +3378,7 @@ def train_epoch(
                 "selection_diversity_effective_strength": float(selection_diversity_effective_strength),
                 "selection_diversity_min_base_votes": float(args.selection_diversity_min_base_votes),
                 "selection_diversity_max_base_votes": float(args.selection_diversity_max_base_votes),
+                "selection_diversity_zero_vote_penalty": float(args.selection_diversity_zero_vote_penalty),
                 "diversity_base_vote_gate_keep_frac": float(
                     np.mean(diversity_base_vote_gate_keep_fracs)
                     if diversity_base_vote_gate_keep_fracs

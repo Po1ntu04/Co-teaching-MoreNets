@@ -63,6 +63,7 @@ def summarize_process(path: str, last_k: int) -> Dict[str, Any]:
         "selection_diversity_q_gate_mult": config.get("selection_diversity_q_gate_mult"),
         "selection_diversity_min_base_votes": config.get("selection_diversity_min_base_votes"),
         "selection_diversity_max_base_votes": config.get("selection_diversity_max_base_votes"),
+        "selection_diversity_zero_vote_penalty": config.get("selection_diversity_zero_vote_penalty"),
         "selection_diversity_start_epoch": config.get("selection_diversity_start_epoch"),
         "selection_diversity_ramp_epochs": config.get("selection_diversity_ramp_epochs"),
         "epochs_completed": len(epochs),
@@ -150,6 +151,7 @@ def summarize_process(path: str, last_k: int) -> Dict[str, Any]:
         "diversity_base_vote_gate_applied_rate",
         "selection_diversity_min_base_votes",
         "selection_diversity_max_base_votes",
+        "selection_diversity_zero_vote_penalty",
     ]
     for key in mechanism_keys:
         row[f"last5_{key}"] = finite_mean(proc(e, f"{key}_mean") for e in tail)
