@@ -7,6 +7,7 @@ param(
     [string]$Branch = "",
     [string]$Session = "",
     [int]$Gpu = -1,
+    [double]$QGatePoolMult = 1.25,
     [switch]$SkipGitSync,
     [switch]$SkipRemoteGitSync,
     [switch]$NoWait,
@@ -181,7 +182,8 @@ function Get-QCommand {
         [int]$NumModels,
         [int]$Seed,
         [int]$Gpu,
-        [string]$RunName
+        [string]$RunName,
+        [double]$QGatePoolMult
     )
     $epochs = 30
     $iters = 100
@@ -210,7 +212,8 @@ function Get-QCommand {
         "--result_dir results_diag/q_isolation/$RunName"
     )
     if ($Mode -eq "gate") {
-        $parts += "--q_gate_pool_mult 1.25"
+        $poolMultText = [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, "{0:0.###}", $QGatePoolMult)
+        $parts += "--q_gate_pool_mult $poolMultText"
     }
     return ($parts -join " ")
 }
@@ -237,11 +240,15 @@ if ($Gpu -lt 0) {
 }
 
 $runName = "qiso_${Mode}_m${NumModels}_seed${Seed}"
+if ($Mode -eq "gate" -and [Math]::Abs($QGatePoolMult - 1.25) -gt 0.000001) {
+    $poolTag = ([string]::Format([System.Globalization.CultureInfo]::InvariantCulture, "{0:0.###}", $QGatePoolMult)) -replace "\.", "p"
+    $runName = "${runName}_pool${poolTag}"
+}
 if (-not $Session) {
     $Session = $runName
 }
 $logFile = "logs/q_isolation/$Session.log"
-$runCmd = Get-QCommand -Mode $Mode -NumModels $NumModels -Seed $Seed -Gpu $Gpu -RunName $runName
+$runCmd = Get-QCommand -Mode $Mode -NumModels $NumModels -Seed $Seed -Gpu $Gpu -RunName $runName -QGatePoolMult $QGatePoolMult
 
 $remoteScript = @'
 set -euo pipefail
