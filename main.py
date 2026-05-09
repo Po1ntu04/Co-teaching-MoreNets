@@ -126,15 +126,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "diagnostic_only",
             "prior_only",
             "selection_only",
+            "gate_selection",
             "weight_only",
             "replay_admission_only",
         ],
         help=(
             "isolate how q is allowed to affect training: standard keeps the legacy path; "
             "diagnostic_only logs q without using it; prior_only only updates pi_t; "
-            "selection_only uses q as the hard selector; weight_only uses q in soft/robust losses; "
+            "selection_only uses q as the hard selector; gate_selection uses q as a reliable candidate gate "
+            "before peer-loss hard selection; weight_only uses q in soft/robust losses; "
             "replay_admission_only uses q only for replay admission"
         ),
+    )
+    parser.add_argument(
+        "--q_gate_pool_mult",
+        type=float,
+        default=1.25,
+        help="candidate-pool multiplier for q_usage_mode=gate_selection",
     )
     # ------------------------------------------------------------------------
     # Prior / pi_t update (slow variable for streaming)
@@ -551,6 +559,7 @@ def q_usage_flags(args) -> Dict[str, bool]:
     mode = getattr(args, "q_usage_mode", "standard")
     return {
         "selection": mode == "selection_only",
+        "gate": mode == "gate_selection",
         "prior": mode in ("standard", "prior_only"),
         "weight": mode in ("standard", "weight_only"),
         "replay": mode in ("standard", "replay_admission_only"),
@@ -2698,6 +2707,21 @@ def train_epoch(
             k = min(k, batch_size)
             q_selected = torch.topk(Q_i, k, largest=True).indices
             selections = [q_selected for _ in range(len(models))]
+        elif q_flags["gate"]:
+            k = max(1, int(math.ceil(remember_rate * batch_size)))
+            k = min(k, batch_size)
+            gate_mult = max(1.0, float(args.q_gate_pool_mult))
+            pool_k = max(k, int(math.ceil(gate_mult * k)))
+            pool_k = min(pool_k, batch_size)
+            q_pool = torch.topk(Q_i, pool_k, largest=True).indices
+            pool_mask = torch.zeros(batch_size, device=images.device, dtype=torch.bool)
+            pool_mask[q_pool] = True
+            gated_selections: List[torch.Tensor] = []
+            for m_idx in range(len(models)):
+                agg_loss = aggregate_losses(loss_stack, m_idx, active_mask_tensor, mode=args.aggregation).clone()
+                agg_loss[~pool_mask] = float("inf")
+                gated_selections.append(torch.topk(agg_loss, k, largest=False).indices)
+            selections = gated_selections
 
         current_overlap = selection_overlap(selections, batch_size, images.device, active_mask)
         batch_accumulator["overlap"].append(current_overlap)

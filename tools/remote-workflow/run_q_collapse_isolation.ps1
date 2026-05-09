@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("smoke", "diagnostic", "prior", "selection", "weight", "standard")]
+    [ValidateSet("smoke", "diagnostic", "prior", "selection", "gate", "weight", "standard")]
     [string]$Mode = "smoke",
     [ValidateSet(2, 3, 5)]
     [int]$NumModels = 3,
@@ -162,6 +162,7 @@ function Get-QUsageMode {
     if ($Mode -eq "diagnostic" -or $Mode -eq "smoke") { return "diagnostic_only" }
     if ($Mode -eq "prior") { return "prior_only" }
     if ($Mode -eq "selection") { return "selection_only" }
+    if ($Mode -eq "gate") { return "gate_selection" }
     if ($Mode -eq "weight") { return "weight_only" }
     if ($Mode -eq "standard") { return "standard" }
     throw "Unsupported mode: $Mode"
@@ -208,6 +209,9 @@ function Get-QCommand {
         "--val_split 0.1 --seed $Seed",
         "--result_dir results_diag/q_isolation/$RunName"
     )
+    if ($Mode -eq "gate") {
+        $parts += "--q_gate_pool_mult 1.25"
+    }
     return ($parts -join " ")
 }
 
