@@ -6,7 +6,7 @@ import json
 import math
 import os
 from itertools import combinations
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -117,6 +117,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="weight for teacher consistency evidence in hybrid q",
     )
     parser.add_argument("--q_rank_weight", type=float, default=1.0, help="weight for rank evidence in hybrid q")
+    parser.add_argument(
+        "--q_usage_mode",
+        type=str,
+        default="standard",
+        choices=[
+            "standard",
+            "diagnostic_only",
+            "prior_only",
+            "selection_only",
+            "weight_only",
+            "replay_admission_only",
+        ],
+        help=(
+            "isolate how q is allowed to affect training: standard keeps the legacy path; "
+            "diagnostic_only logs q without using it; prior_only only updates pi_t; "
+            "selection_only uses q as the hard selector; weight_only uses q in soft/robust losses; "
+            "replay_admission_only uses q only for replay admission"
+        ),
+    )
     # ------------------------------------------------------------------------
     # Prior / pi_t update (slow variable for streaming)
     parser.add_argument("--pi_init", type=float, default=0.8, help="initial clean prior pi")
@@ -466,6 +485,77 @@ def aggregate_losses(
     if mode == "median":
         return peer_losses.median(dim=0).values
     return peer_losses.mean(dim=0)
+
+
+def selection_overlap(
+    selections: Sequence[torch.Tensor],
+    batch_size: int,
+    device: torch.device,
+    active_mask: Sequence[bool],
+) -> float:
+    active_pairs = list(combinations([i for i, a in enumerate(active_mask) if a], 2))
+    if not active_pairs:
+        return 0.0
+    overlaps: List[float] = []
+    for a_idx, b_idx in active_pairs:
+        mask_a = torch.zeros(batch_size, device=device, dtype=torch.bool)
+        mask_b = torch.zeros(batch_size, device=device, dtype=torch.bool)
+        mask_a[selections[a_idx]] = True
+        mask_b[selections[b_idx]] = True
+        overlap = (mask_a & mask_b).sum().float() / mask_a.sum().clamp(min=1)
+        overlaps.append(float(overlap.item()))
+    return float(max(overlaps)) if overlaps else 0.0
+
+
+def binary_auc(scores: np.ndarray, labels: np.ndarray) -> float:
+    scores = np.asarray(scores, dtype=np.float64)
+    labels = np.asarray(labels, dtype=np.int64)
+    finite = np.isfinite(scores)
+    scores = scores[finite]
+    labels = labels[finite]
+    if scores.size == 0:
+        return float("nan")
+    positives = labels == 1
+    n_pos = int(positives.sum())
+    n_neg = int(labels.size - n_pos)
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+
+    order = np.argsort(scores, kind="mergesort")
+    sorted_scores = scores[order]
+    ranks = np.empty(scores.size, dtype=np.float64)
+    start = 0
+    while start < scores.size:
+        end = start + 1
+        while end < scores.size and sorted_scores[end] == sorted_scores[start]:
+            end += 1
+        avg_rank = 0.5 * (start + 1 + end)
+        ranks[order[start:end]] = avg_rank
+        start = end
+    rank_sum_pos = float(ranks[positives].sum())
+    return (rank_sum_pos - n_pos * (n_pos + 1) / 2.0) / float(n_pos * n_neg)
+
+
+def clean_mask_for_indices(base_dataset, indices_np: np.ndarray) -> Optional[np.ndarray]:
+    noise_or_not = getattr(base_dataset, "noise_or_not", None)
+    if noise_or_not is None:
+        return None
+    clean = np.zeros(len(indices_np), dtype=np.int64)
+    for local_idx, global_idx in enumerate(indices_np.astype(np.int64)):
+        if 0 <= global_idx < len(noise_or_not):
+            clean[local_idx] = int(bool(noise_or_not[global_idx]))
+    return clean
+
+
+def q_usage_flags(args) -> Dict[str, bool]:
+    mode = getattr(args, "q_usage_mode", "standard")
+    return {
+        "selection": mode == "selection_only",
+        "prior": mode in ("standard", "prior_only"),
+        "weight": mode in ("standard", "weight_only"),
+        "replay": mode in ("standard", "replay_admission_only"),
+        "memory": mode in ("standard", "prior_only", "weight_only", "replay_admission_only"),
+    }
 
 
 def build_teacher_models(models: List[torch.nn.Module]) -> List[torch.nn.Module]:
@@ -2405,6 +2495,7 @@ def train_epoch(
         teacher.eval()
     active_mask_tensor = torch.tensor(active_mask, device=device, dtype=torch.bool)
     base_dataset = train_dataset.dataset if isinstance(train_dataset, Subset) else train_dataset
+    q_flags = q_usage_flags(args)
 
     if bmm is None and args.q_mode == "bmm":
         bmm = BetaMixture1D(max_iters=args.bmm_max_iters)
@@ -2440,6 +2531,11 @@ def train_epoch(
         "utility_gap_mean": [0.0 for _ in models],
         "q_mean": [],
         "q_std": [],
+        "q_min": [],
+        "q_max": [],
+        "q_entropy": [],
+        "q_clean_auc": [],
+        "selected_clean_rate": [],
         "overlap": [],
     }
     num_batches = 0
@@ -2506,18 +2602,9 @@ def train_epoch(
             selected = torch.topk(agg_loss, k, largest=False).indices
             selections.append(selected)
 
-        active_pairs = list(combinations([i for i, a in enumerate(active_mask) if a], 2))
-        current_overlap = 0.0
-        for a_idx, b_idx in active_pairs:
-            mask_a = torch.zeros(batch_size, device=images.device, dtype=torch.bool)
-            mask_b = torch.zeros(batch_size, device=images.device, dtype=torch.bool)
-            mask_a[selections[a_idx]] = True
-            mask_b[selections[b_idx]] = True
-            overlap = (mask_a & mask_b).sum().float() / mask_a.sum().clamp(min=1)
-            batch_accumulator["overlap"].append(overlap.item())
-            current_overlap = max(current_overlap, overlap.item())
+        current_overlap = selection_overlap(selections, batch_size, images.device, active_mask)
 
-        if args.explore_delta > 0 and current_overlap > args.explore_trigger:
+        if (not q_flags["selection"]) and args.explore_delta > 0 and current_overlap > args.explore_trigger:
             with torch.no_grad():
                 entropy = -(committee_probs * (committee_probs + 1e-12).log()).sum(dim=1)
             explore_k = max(1, int(args.explore_delta * batch_size))
@@ -2586,31 +2673,61 @@ def train_epoch(
                 tau = agg_loss_all.median()
             q_batch = torch.sigmoid((tau - agg_loss_all) / max(temp_q, 1e-6))
 
-        batch_accumulator["q_mean"].append(q_batch.mean().item())
-        batch_accumulator["q_std"].append(q_batch.std().item())
-
         idx_cpu = indices.detach().cpu().numpy().astype(np.int64)
         q_cpu = q_batch.detach().cpu().numpy()
         label_cpu = labels.detach().cpu().numpy().astype(np.int64)
-        for idx_value, q_value in zip(idx_cpu, q_cpu):
-            if 0 <= idx_value < len(q_global):
-                q_global[idx_value] = args.q_ema * q_global[idx_value] + (1.0 - args.q_ema) * q_value
+        clean_np = clean_mask_for_indices(base_dataset, idx_cpu)
 
-        q_slow_tensor = torch.zeros(batch_size, device=images.device, dtype=torch.float32)
-        for local_idx, global_idx in enumerate(idx_cpu):
-            if 0 <= global_idx < len(q_global):
-                q_slow_tensor[local_idx] = float(q_global[global_idx])
-            else:
-                q_slow_tensor[local_idx] = q_batch[local_idx].detach()
-        Q_i = q_slow_tensor
+        if q_flags["memory"]:
+            for idx_value, q_value in zip(idx_cpu, q_cpu):
+                if 0 <= idx_value < len(q_global):
+                    q_global[idx_value] = args.q_ema * q_global[idx_value] + (1.0 - args.q_ema) * q_value
 
-        sum_q = float(Q_i.sum().item())
-        a = args.pi_beta_a
-        b = args.pi_beta_b
-        pi_hat = (a + sum_q) / (a + b + float(batch_size))
-        pi_t = args.pi_ema * pi_t + (1.0 - args.pi_ema) * pi_hat
+            q_slow_tensor = torch.zeros(batch_size, device=images.device, dtype=torch.float32)
+            for local_idx, global_idx in enumerate(idx_cpu):
+                if 0 <= global_idx < len(q_global):
+                    q_slow_tensor[local_idx] = float(q_global[global_idx])
+                else:
+                    q_slow_tensor[local_idx] = q_batch[local_idx].detach()
+            Q_i = q_slow_tensor
+        else:
+            Q_i = q_batch.detach()
 
-        if args.replay_size > 0:
+        if q_flags["selection"]:
+            k = max(1, int(math.ceil(remember_rate * batch_size)))
+            k = min(k, batch_size)
+            q_selected = torch.topk(Q_i, k, largest=True).indices
+            selections = [q_selected for _ in range(len(models))]
+
+        current_overlap = selection_overlap(selections, batch_size, images.device, active_mask)
+        batch_accumulator["overlap"].append(current_overlap)
+
+        q_clamped = q_batch.detach().clamp(1e-6, 1.0 - 1e-6)
+        q_entropy = -(q_clamped * q_clamped.log() + (1.0 - q_clamped) * (1.0 - q_clamped).log())
+        q_entropy = q_entropy / max(math.log(2.0), 1e-12)
+        batch_accumulator["q_mean"].append(q_batch.mean().item())
+        batch_accumulator["q_std"].append(q_batch.std(unbiased=False).item())
+        batch_accumulator["q_min"].append(q_batch.min().item())
+        batch_accumulator["q_max"].append(q_batch.max().item())
+        batch_accumulator["q_entropy"].append(q_entropy.mean().item())
+        if clean_np is not None:
+            batch_accumulator["q_clean_auc"].append(binary_auc(q_cpu, clean_np))
+            selected_rates: List[float] = []
+            clean_tensor = torch.tensor(clean_np, device=images.device, dtype=torch.float32)
+            for sel in selections:
+                if sel.numel() > 0:
+                    selected_rates.append(float(clean_tensor[sel].mean().item()))
+            if selected_rates:
+                batch_accumulator["selected_clean_rate"].append(float(np.mean(selected_rates)))
+
+        if q_flags["prior"]:
+            sum_q = float(Q_i.sum().item())
+            a = args.pi_beta_a
+            b = args.pi_beta_b
+            pi_hat = (a + sum_q) / (a + b + float(batch_size))
+            pi_t = args.pi_ema * pi_t + (1.0 - args.pi_ema) * pi_hat
+
+        if q_flags["replay"] and args.replay_size > 0:
             if args.replay_mode == "purified" and purified_replay is not None:
                 purified_replay.update(idx_cpu, label_cpu, Q_i.detach().cpu().numpy(), current_epoch=epoch)
             else:
@@ -2636,7 +2753,10 @@ def train_epoch(
 
             hard_selection = torch.zeros(batch_size, device=images.device, dtype=torch.float32)
             hard_selection[sel] = 1.0
-            training_q = args.q_gamma * Q_i + (1.0 - args.q_gamma) * hard_selection
+            if q_flags["weight"]:
+                training_q = args.q_gamma * Q_i + (1.0 - args.q_gamma) * hard_selection
+            else:
+                training_q = hard_selection
             student_weight = 0.5 if not active_mask[m_idx] else 1.0
             teacher_probs_for_loss = teacher_committee_probs.detach()
 
@@ -2756,6 +2876,13 @@ def train_epoch(
         )
     metrics["q_mean"] = float(np.mean(batch_accumulator["q_mean"])) if batch_accumulator["q_mean"] else 0.0
     metrics["q_std"] = float(np.mean(batch_accumulator["q_std"])) if batch_accumulator["q_std"] else 0.0
+    metrics["q_min"] = float(np.mean(batch_accumulator["q_min"])) if batch_accumulator["q_min"] else 0.0
+    metrics["q_max"] = float(np.mean(batch_accumulator["q_max"])) if batch_accumulator["q_max"] else 0.0
+    metrics["q_entropy"] = float(np.mean(batch_accumulator["q_entropy"])) if batch_accumulator["q_entropy"] else 0.0
+    q_auc_values = [v for v in batch_accumulator["q_clean_auc"] if np.isfinite(v)]
+    metrics["q_clean_auc"] = float(np.mean(q_auc_values)) if q_auc_values else 0.0
+    selected_clean_values = [v for v in batch_accumulator["selected_clean_rate"] if np.isfinite(v)]
+    metrics["selected_clean_rate"] = float(np.mean(selected_clean_values)) if selected_clean_values else 0.0
     metrics["overlap"] = float(np.mean(batch_accumulator["overlap"])) if batch_accumulator["overlap"] else 0.0
 
     if args.q_mode == "bmm" and epoch_losses:
@@ -3068,7 +3195,8 @@ def main():
             + " "
             + " ".join([f"TestAcc_M{i}:{acc:.2f}%" for i, acc in enumerate(test_accs)])
                         + f" Ensemble:{ensemble_acc:.2f}% q_mean:{train_metrics['q_mean']:.3f} "
-                            f"q_std:{train_metrics['q_std']:.3f} overlap:{train_metrics['overlap']:.3f} pi:{pi_t:.3f}"
+                            f"q_std:{train_metrics['q_std']:.3f} q_auc:{train_metrics.get('q_clean_auc', 0.0):.3f} "
+                            f"overlap:{train_metrics['overlap']:.3f} pi:{pi_t:.3f}"
         )
         
         # Save to CSV
@@ -3094,6 +3222,11 @@ def main():
             "val_acc": val_accs[0] if val_loader is not None else None,
             "q_mean": train_metrics['q_mean'],
             "q_std": train_metrics['q_std'],
+            "q_min": train_metrics.get("q_min", 0.0),
+            "q_max": train_metrics.get("q_max", 0.0),
+            "q_entropy": train_metrics.get("q_entropy", 0.0),
+            "q_clean_auc": train_metrics.get("q_clean_auc", 0.0),
+            "selected_clean_rate": train_metrics.get("selected_clean_rate", 0.0),
             "overlap": train_metrics['overlap'],
             "pi_t": pi_t,
             "active_models": sum(active_mask),
