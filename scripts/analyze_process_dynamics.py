@@ -100,6 +100,57 @@ def summarize_process(path: str, last_k: int) -> Dict[str, Any]:
         "last5_gate_pool_clean_rate": finite_mean(proc(e, "gate_pool_clean_rate_mean") for e in tail),
         "last5_gate_pool_q_mean": finite_mean(proc(e, "gate_pool_q_mean_mean") for e in tail),
     }
+    mechanism_keys = [
+        "base_selected_any_frac",
+        "base_selected_all_frac",
+        "base_selected_partial_frac",
+        "base_selected_vote_mean",
+        "base_selected_vote_std",
+        "base_vote_entropy_norm",
+        "base_pair_overlap_mean",
+        "base_pair_overlap_std",
+        "base_pair_overlap_min",
+        "base_pair_overlap_max",
+        "base_pair_jaccard_mean",
+        "selected_any_frac",
+        "selected_all_frac",
+        "selected_partial_frac",
+        "selected_vote_mean",
+        "selected_vote_std",
+        "vote_entropy_norm",
+        "pair_overlap_mean",
+        "pair_overlap_std",
+        "pair_overlap_min",
+        "pair_overlap_max",
+        "pair_jaccard_mean",
+        "loss_rank_corr_mean",
+        "loss_rank_corr_std",
+        "loss_rank_corr_min",
+        "loss_rank_corr_max",
+        "grad_cos_mean",
+        "grad_cos_std",
+        "grad_cos_min",
+        "grad_cos_max",
+        "update_cos_mean",
+        "update_cos_std",
+        "update_cos_min",
+        "update_cos_max",
+        "selected_any_label_entropy",
+        "selected_all_label_entropy",
+        "selected_partial_label_entropy",
+        "unselected_label_entropy",
+        "selected_any_clean_rate",
+        "selected_all_clean_rate",
+        "selected_partial_clean_rate",
+        "unselected_any_clean_rate",
+    ]
+    for key in mechanism_keys:
+        row[f"last5_{key}"] = finite_mean(proc(e, f"{key}_mean") for e in tail)
+    for vote in range(9):
+        for prefix in ("", "base_"):
+            for metric in ("vote_frac", "vote_clean_rate", "vote_count"):
+                key = f"{prefix}{metric}_{vote}"
+                row[f"last5_{key}"] = finite_mean(proc(e, f"{key}_mean") for e in tail)
     return row
 
 

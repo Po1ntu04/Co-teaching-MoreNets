@@ -568,6 +568,35 @@ def selection_overlap(
     return float(max(overlaps)) if overlaps else 0.0
 
 
+def pairwise_selection_overlap_stats(
+    selections: Sequence[torch.Tensor],
+    batch_size: int,
+    device: torch.device,
+    active_mask: Sequence[bool],
+    prefix: str = "",
+) -> Dict[str, float]:
+    active_pairs = list(combinations([i for i, a in enumerate(active_mask) if a], 2))
+    overlaps: List[float] = []
+    jaccards: List[float] = []
+    for a_idx, b_idx in active_pairs:
+        mask_a = torch.zeros(batch_size, device=device, dtype=torch.bool)
+        mask_b = torch.zeros(batch_size, device=device, dtype=torch.bool)
+        mask_a[selections[a_idx]] = True
+        mask_b[selections[b_idx]] = True
+        intersection = (mask_a & mask_b).sum().float()
+        overlaps.append(float((intersection / mask_a.sum().clamp(min=1)).item()))
+        jaccards.append(float((intersection / (mask_a | mask_b).sum().float().clamp(min=1)).item()))
+    stats: Dict[str, float] = {}
+    for name, values in (("pair_overlap", overlaps), ("pair_jaccard", jaccards)):
+        if not values:
+            continue
+        stats[f"{prefix}{name}_mean"] = float(np.mean(values))
+        stats[f"{prefix}{name}_std"] = float(np.std(values))
+        stats[f"{prefix}{name}_min"] = float(np.min(values))
+        stats[f"{prefix}{name}_max"] = float(np.max(values))
+    return stats
+
+
 def selection_change_rate(
     reference: Sequence[torch.Tensor],
     current: Sequence[torch.Tensor],
@@ -649,6 +678,135 @@ def _tensor_mean_or_zero(values: torch.Tensor) -> float:
     return float(values.detach().float().mean().item())
 
 
+def _normalized_entropy_from_counts(counts: torch.Tensor, num_bins: int) -> float:
+    counts = counts.detach().float()
+    total = counts.sum().clamp(min=1.0)
+    probs = counts / total
+    probs = probs[probs > 0]
+    if probs.numel() == 0 or num_bins <= 1:
+        return 0.0
+    entropy = -(probs * probs.log()).sum()
+    return float((entropy / math.log(float(num_bins))).item())
+
+
+def selection_counts_for(
+    selections: Sequence[torch.Tensor],
+    batch_size: int,
+    device: torch.device,
+    active_mask: Sequence[bool],
+) -> torch.Tensor:
+    selection_counts = torch.zeros(batch_size, device=device, dtype=torch.float32)
+    for model_idx, sel in enumerate(selections):
+        if model_idx < len(active_mask) and not active_mask[model_idx]:
+            continue
+        if sel.numel() > 0:
+            selection_counts[sel] += 1.0
+    return selection_counts
+
+
+def add_vote_metrics(
+    record: Dict[str, float],
+    counts: torch.Tensor,
+    active_count: int,
+    prefix: str = "",
+    clean_tensor: Optional[torch.Tensor] = None,
+) -> None:
+    active_count = max(1, int(active_count))
+    counts = counts.detach().float()
+    counts_long = counts.long()
+    hist = torch.bincount(counts_long.clamp(min=0, max=active_count), minlength=active_count + 1).float()
+    record[f"{prefix}vote_entropy_norm"] = _normalized_entropy_from_counts(hist, active_count + 1)
+    record[f"{prefix}selected_any_frac"] = float((counts > 0).float().mean().item())
+    record[f"{prefix}selected_all_frac"] = float((counts >= active_count).float().mean().item())
+    record[f"{prefix}selected_partial_frac"] = float(((counts > 0) & (counts < active_count)).float().mean().item())
+    record[f"{prefix}selected_vote_mean"] = float(counts.mean().item())
+    record[f"{prefix}selected_vote_std"] = float(counts.std(unbiased=False).item())
+    for vote in range(active_count + 1):
+        mask = counts_long == vote
+        frac = float(mask.float().mean().item())
+        record[f"{prefix}vote_frac_{vote}"] = frac
+        record[f"{prefix}vote_count_{vote}"] = float(mask.sum().item())
+        if clean_tensor is not None:
+            record[f"{prefix}vote_clean_rate_{vote}"] = _tensor_mean_or_zero(clean_tensor[mask])
+
+
+def label_entropy_for_mask(labels: torch.Tensor, mask: torch.Tensor, num_classes: int) -> float:
+    if mask.numel() == 0 or not bool(mask.any().item()):
+        return 0.0
+    values = labels[mask].detach().long().clamp(min=0, max=max(0, num_classes - 1))
+    counts = torch.bincount(values, minlength=max(1, num_classes)).float()
+    return _normalized_entropy_from_counts(counts, max(1, num_classes))
+
+
+def pairwise_rank_correlation_stats(
+    values: torch.Tensor,
+    active_mask: torch.Tensor,
+    prefix: str = "loss_rank_corr",
+) -> Dict[str, float]:
+    if values.dim() != 2:
+        return {}
+    active = active_mask.detach().bool()
+    active_values = values.detach().float()[active]
+    if active_values.size(0) < 2 or active_values.size(1) < 2:
+        return {}
+    ranks = torch.argsort(torch.argsort(active_values, dim=1), dim=1).float()
+    ranks = ranks - ranks.mean(dim=1, keepdim=True)
+    denom = ranks.norm(dim=1, keepdim=True).clamp_min(1e-12)
+    normalized = ranks / denom
+    corr = normalized @ normalized.t()
+    upper_idx = torch.triu_indices(corr.size(0), corr.size(1), offset=1, device=corr.device)
+    vals = corr[upper_idx[0], upper_idx[1]].detach().cpu().numpy()
+    if vals.size == 0:
+        return {}
+    return {
+        f"{prefix}_mean": float(np.mean(vals)),
+        f"{prefix}_std": float(np.std(vals)),
+        f"{prefix}_min": float(np.min(vals)),
+        f"{prefix}_max": float(np.max(vals)),
+    }
+
+
+def flatten_grad_vector(model: torch.nn.Module) -> torch.Tensor:
+    parts: List[torch.Tensor] = []
+    for param in model.parameters():
+        if param.grad is None:
+            continue
+        parts.append(param.grad.detach().float().reshape(-1).cpu())
+    if not parts:
+        return torch.empty(0)
+    return torch.cat(parts)
+
+
+def update_vector_from_snapshot(model: torch.nn.Module, before: Sequence[torch.Tensor]) -> torch.Tensor:
+    parts: List[torch.Tensor] = []
+    with torch.no_grad():
+        for param, old_param in zip(model.parameters(), before):
+            parts.append((param.detach() - old_param).float().reshape(-1).cpu())
+    if not parts:
+        return torch.empty(0)
+    return torch.cat(parts)
+
+
+def pairwise_cosine_stats(vectors: Sequence[torch.Tensor], prefix: str) -> Dict[str, float]:
+    vectors = [vec.detach().float() for vec in vectors if vec is not None and vec.numel() > 0]
+    if len(vectors) < 2:
+        return {}
+    values: List[float] = []
+    for vec_a, vec_b in combinations(vectors, 2):
+        denom = float(vec_a.norm().item() * vec_b.norm().item())
+        if denom <= 1e-12:
+            continue
+        values.append(float(torch.dot(vec_a, vec_b).item() / denom))
+    if not values:
+        return {}
+    return {
+        f"{prefix}_mean": float(np.mean(values)),
+        f"{prefix}_std": float(np.std(values)),
+        f"{prefix}_min": float(np.min(values)),
+        f"{prefix}_max": float(np.max(values)),
+    }
+
+
 def parameter_norm(model: torch.nn.Module) -> float:
     total = 0.0
     with torch.no_grad():
@@ -703,6 +861,22 @@ def summarize_process_records(records: List[Dict[str, float]], bins: int) -> Dic
         "update_norm_mean",
         "update_to_param_mean",
     ]
+    dynamic_prefixes = (
+        "base_",
+        "vote_",
+        "selected_",
+        "unselected_",
+        "pair_",
+        "loss_rank_corr_",
+        "grad_cos_",
+        "update_cos_",
+    )
+    for record in records:
+        for key in record.keys():
+            if key in keys:
+                continue
+            if any(key.startswith(prefix) for prefix in dynamic_prefixes):
+                keys.append(key)
     summary: Dict[str, object] = {"num_batches": len(records), "bins": bins}
     for key in keys:
         values = [_safe_float(record.get(key), default=float("nan")) for record in records]
@@ -818,6 +992,7 @@ def sam_update(
     optimizer.zero_grad()
     perturbed_loss = loss_builder()
     perturbed_loss.backward()
+    grad_vector = flatten_grad_vector(model) if collect_process_stats else torch.empty(0)
     with torch.no_grad():
         for p, e_w in zip(model.parameters(), e_ws):
             if e_w is None:
@@ -827,11 +1002,14 @@ def sam_update(
     param_norm_value = parameter_norm(model) if collect_process_stats else 0.0
     optimizer.step()
     update_norm_value = update_norm_from_snapshot(model, before_params) if before_params is not None else 0.0
+    update_vector = update_vector_from_snapshot(model, before_params) if before_params is not None else torch.empty(0)
     optimizer._last_process_stats = {
         "grad_norm": float(grad_norm_value),
         "update_norm": float(update_norm_value),
         "param_norm": float(param_norm_value),
         "sam_perturb_norm": math.sqrt(max(perturb_sq, 0.0)),
+        "grad_vector": grad_vector,
+        "update_vector": update_vector,
     }
     return clean_loss.item(), perturbed_loss.item()
 
@@ -846,15 +1024,23 @@ def standard_update(
     loss = loss_builder()
     loss.backward()
     grad_norm_value = gradient_norm(model) if model is not None else 0.0
+    grad_vector = flatten_grad_vector(model) if (collect_process_stats and model is not None) else torch.empty(0)
     before_params = capture_parameters(model) if (collect_process_stats and model is not None) else None
     param_norm_value = parameter_norm(model) if (collect_process_stats and model is not None) else 0.0
     optimizer.step()
     update_norm_value = update_norm_from_snapshot(model, before_params) if (before_params is not None and model is not None) else 0.0
+    update_vector = (
+        update_vector_from_snapshot(model, before_params)
+        if (before_params is not None and model is not None)
+        else torch.empty(0)
+    )
     optimizer._last_process_stats = {
         "grad_norm": float(grad_norm_value),
         "update_norm": float(update_norm_value),
         "param_norm": float(param_norm_value),
         "sam_perturb_norm": 0.0,
+        "grad_vector": grad_vector,
+        "update_vector": update_vector,
     }
     loss_value = loss.item()
     return loss_value, loss_value
@@ -3081,14 +3267,17 @@ def train_epoch(
                         replay_set.add(int(i))
 
         batch_process_record: Optional[Dict[str, float]] = None
-        selection_counts = torch.zeros(batch_size, device=images.device, dtype=torch.float32)
-        for sel in selections:
-            if sel.numel() > 0:
-                selection_counts[sel] += 1.0
+        active_count = max(1, int(sum(bool(is_active) for is_active in active_mask)))
+        selection_counts = selection_counts_for(selections, batch_size, images.device, active_mask)
+        base_selection_counts = selection_counts_for(base_selections, batch_size, images.device, active_mask)
         selected_any = selection_counts > 0
-        selected_all = selection_counts >= max(1, len(models))
+        selected_all = selection_counts >= active_count
+        selected_partial = (selection_counts > 0) & (selection_counts < active_count)
         unselected_any = ~selected_any
         if args.diag_process:
+            clean_tensor_process: Optional[torch.Tensor] = None
+            if clean_np is not None:
+                clean_tensor_process = torch.tensor(clean_np, device=images.device, dtype=torch.float32)
             batch_process_record = {
                 "epoch": float(epoch),
                 "batch_idx": float(batch_idx),
@@ -3109,7 +3298,9 @@ def train_epoch(
                 "base_selected_in_gate_rate": float(base_selected_in_gate_rate),
                 "selected_any_frac": float(selected_any.float().mean().item()),
                 "selected_all_frac": float(selected_all.float().mean().item()),
+                "selected_partial_frac": float(selected_partial.float().mean().item()),
                 "selected_vote_mean": float(selection_counts.mean().item()),
+                "selected_vote_std": float(selection_counts.std(unbiased=False).item()),
                 "selected_q_mean": _tensor_mean_or_zero(Q_i[selected_any]),
                 "unselected_q_mean": _tensor_mean_or_zero(Q_i[unselected_any]),
                 "selected_loss_mean": _tensor_mean_or_zero(agg_loss_all[selected_any]),
@@ -3117,10 +3308,32 @@ def train_epoch(
                 "gate_pool_frac": float(gate_pool_frac),
                 "gate_pool_clean_rate": float(gate_pool_clean_rate),
                 "gate_pool_q_mean": float(gate_pool_q_mean),
+                "selected_any_label_entropy": label_entropy_for_mask(labels, selected_any, num_classes),
+                "selected_all_label_entropy": label_entropy_for_mask(labels, selected_all, num_classes),
+                "selected_partial_label_entropy": label_entropy_for_mask(labels, selected_partial, num_classes),
+                "unselected_label_entropy": label_entropy_for_mask(labels, unselected_any, num_classes),
             }
-            if clean_np is not None:
-                clean_tensor_process = torch.tensor(clean_np, device=images.device, dtype=torch.float32)
+            add_vote_metrics(batch_process_record, selection_counts, active_count, clean_tensor=clean_tensor_process)
+            add_vote_metrics(
+                batch_process_record,
+                base_selection_counts,
+                active_count,
+                prefix="base_",
+                clean_tensor=clean_tensor_process,
+            )
+            batch_process_record.update(
+                pairwise_selection_overlap_stats(selections, batch_size, images.device, active_mask)
+            )
+            batch_process_record.update(
+                pairwise_selection_overlap_stats(base_selections, batch_size, images.device, active_mask, prefix="base_")
+            )
+            batch_process_record.update(pairwise_rank_correlation_stats(loss_stack, active_mask_tensor))
+            if clean_tensor_process is not None:
                 batch_process_record["selected_any_clean_rate"] = _tensor_mean_or_zero(clean_tensor_process[selected_any])
+                batch_process_record["selected_all_clean_rate"] = _tensor_mean_or_zero(clean_tensor_process[selected_all])
+                batch_process_record["selected_partial_clean_rate"] = _tensor_mean_or_zero(
+                    clean_tensor_process[selected_partial]
+                )
                 batch_process_record["unselected_any_clean_rate"] = _tensor_mean_or_zero(clean_tensor_process[unselected_any])
 
         collect_process_stats = (
@@ -3131,6 +3344,8 @@ def train_epoch(
         model_grad_norms: List[float] = []
         model_update_norms: List[float] = []
         model_update_ratios: List[float] = []
+        model_grad_vectors: List[torch.Tensor] = []
+        model_update_vectors: List[torch.Tensor] = []
         for m_idx, (model, optimizer) in enumerate(zip(models, optimizers)):
             sel = selections[m_idx]
             if sel.numel() == 0:
@@ -3230,6 +3445,12 @@ def train_epoch(
                     model_update_norms.append(update_norm_value)
                 if update_norm_value > 0.0 and param_norm_value > 0.0:
                     model_update_ratios.append(update_norm_value / max(param_norm_value, 1e-12))
+                grad_vec = process_stats.get("grad_vector")
+                update_vec = process_stats.get("update_vector")
+                if isinstance(grad_vec, torch.Tensor) and grad_vec.numel() > 0:
+                    model_grad_vectors.append(grad_vec)
+                if isinstance(update_vec, torch.Tensor) and update_vec.numel() > 0:
+                    model_update_vectors.append(update_vec)
             update_ema_model(model, teacher_models[m_idx], args.teacher_ema)
 
         if model_grad_norms:
@@ -3244,6 +3465,8 @@ def train_epoch(
             batch_process_record["update_to_param_mean"] = (
                 float(np.mean(model_update_ratios)) if model_update_ratios else 0.0
             )
+            batch_process_record.update(pairwise_cosine_stats(model_grad_vectors, "grad_cos"))
+            batch_process_record.update(pairwise_cosine_stats(model_update_vectors, "update_cos"))
             process_records.append(batch_process_record)
 
         teacher_pred = teacher_committee_probs.argmax(dim=1)
